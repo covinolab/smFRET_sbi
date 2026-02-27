@@ -1,17 +1,10 @@
 from pathlib import Path
 from typing import Union, List
-
+from omegaconf import OmegaConf
 import torch
 import torch.distributions as dists
-import yaml
 from sbi import utils as utils
 from sbi.utils.user_input_checks import MultipleIndependent
-
-
-def load_config(config_path: Union[str, Path]) -> dict:
-    """Load a YAML configuration file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
 
 
 def make_covariance_matrix(n: int, scale: float, correlation: float, device: str = "cpu") -> torch.Tensor:
@@ -157,7 +150,7 @@ def generate_spline_fret_prior(
 
 
 def generate_spline_fret_prior_from_config(
-    config: Union[str, Path, dict], 
+    cfg: OmegaConf, 
     device: str = "cpu"
 ) -> Union[MultipleIndependent]:
     """
@@ -188,32 +181,28 @@ def generate_spline_fret_prior_from_config(
     Returns:
         SplineFRETPrior or MultipleIndependent distribution.
     """
-    if isinstance(config, (str, Path)):
-        config = load_config(config)
-    
-    cfg = config.get('prior', config)
 
-    if cfg['spline_mean'] is not None:
-        spline_mean = torch.tensor(cfg['spline_mean'], device=device)
+    if cfg.prior.spline_mean is not None:
+        spline_mean = torch.tensor(cfg.prior.spline_mean, device=device)
         spline_mean = spline_mean - spline_mean.mean()  # Normalize to zero mean
     else:
-        spline_mean = cfg['spline_mean']  # This will be None, and the prior function will default to zero mean
+        spline_mean = cfg.prior.spline_mean  # This will be None, and the prior function will default to zero mean
 
     return generate_spline_fret_prior(
-        num_knots=cfg['num_knots'],
-        logD_lims=tuple(cfg.get('logD_lims', [-2.0, 2.0])),
-        R0_lims=tuple(cfg.get('R0_lims', [3.0, 8.0])),
-        kD_lims=tuple(cfg.get('kD_lims', [0.01, 1.0])),
-        k_gb_lims=tuple(cfg.get('k_gb_lims', [0.0, 0.1])),
-        k_rb_lims=tuple(cfg.get('k_rb_lims', [0.0, 0.1])),
-        eta_g_lims=tuple(cfg.get('eta_g_lims', [0.5, 1.0])),
-        eta_r_lims=tuple(cfg.get('eta_r_lims', [0.5, 1.0])),
-        C_gg_lims=tuple(cfg.get('C_gg_lims', [0.8, 1.0])),
-        C_rr_lims=tuple(cfg.get('C_rr_lims', [0.8, 1.0])),
-        C_gr_lims=tuple(cfg.get('C_gr_lims', [0.0, 0.2])),
-        C_rg_lims=tuple(cfg.get('C_rg_lims', [0.0, 0.2])),
+        num_knots=cfg.prior.num_knots,
+        logD_lims=tuple(cfg.prior.logD_lims),
+        R0_lims=tuple(cfg.prior.R0_lims),
+        kD_lims=tuple(cfg.prior.kD_lims),
+        k_gb_lims=tuple(cfg.prior.k_gb_lims),
+        k_rb_lims=tuple(cfg.prior.k_rb_lims),
+        eta_g_lims=tuple(cfg.prior.eta_g_lims),
+        eta_r_lims=tuple(cfg.prior.eta_r_lims),
+        C_gg_lims=tuple(cfg.prior.C_gg_lims),
+        C_rr_lims=tuple(cfg.prior.C_rr_lims),
+        C_gr_lims=tuple(cfg.prior.C_gr_lims),
+        C_rg_lims=tuple(cfg.prior.C_rg_lims),
         spline_mean=spline_mean,
-        spline_scale=cfg.get('spline_scale', 1.0),
-        spline_correlation=cfg.get('spline_correlation', 0.5),
+        spline_scale=cfg.prior.spline_scale,
+        spline_correlation=cfg.prior.spline_correlation,
         device=device
     )

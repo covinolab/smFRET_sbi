@@ -4,11 +4,13 @@ from pathlib import Path
 from datetime import datetime
 import torch
 import h5py
+from omegaconf import OmegaConf
+import yaml
 from functools import partial
 from sbi.utils.user_input_checks import process_simulator
 from sbi.inference import simulate_for_sbi
-from smFRET_sbi.src.simulator import smFRET_simulator_wrapper as fret_simulator
-from smFRET_sbi.src.priors import generate_spline_fret_prior_from_config, load_config
+from simulator import smFRET_simulator_wrapper as fret_simulator
+from priors import generate_spline_fret_prior_from_config
 
 
 def parse_args():
@@ -71,24 +73,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def generate_simulations(config: dict, args) -> tuple:
+def generate_simulations(cfg: OmegaConf, args) -> tuple:
     """Generate simulations based on configuration."""
     
-    sim_cfg = config['simulator']
-    data_cfg = config['data_generation']
+    num_simulations = args.num_simulations or cfg.data_generation.num_simulations
+    num_workers = args.num_workers or cfg.data_generation.num_workers
+    batch_size = cfg.data_generation.batch_size
     
-    num_simulations = args.num_simulations or data_cfg['num_simulations']
-    num_workers = args.num_workers or data_cfg['num_workers']
-    batch_size = data_cfg['batch_size']
-    
-    prior = generate_spline_fret_prior_from_config(config)
+    prior = generate_spline_fret_prior_from_config(cfg, device="cpu")
     
     simulator = partial(
         fret_simulator,
-        T=sim_cfg['total_time'],
-        deltax=sim_cfg['deltax'],
-        saving_freq=sim_cfg['saving_frequency'],
-        dt=sim_cfg['time_step']
+        T=cfg.simulator.total_time,
+        saving_freq=cfg.simulator.saving_frequency,
+        dt=cfg.simulator.time_step,
+        x_min=cfg.simulator.x_min,
+        x_max=cfg.simulator.x_max,
+        x_init=cfg.simulator.x_init,
+        num_knots=cfg.prior.num_knots,
+        max_G0=cfg.simulator.max_G0,
+        boundary_condition=cfg.simulator.boundary_condition,
+        spline_type=cfg.simulator.spline_type
     )
 
     simulator = process_simulator(simulator, is_numpy_simulator=False, prior=prior)
@@ -101,14 +106,12 @@ def generate_simulations(config: dict, args) -> tuple:
         simulation_batch_size=batch_size
     )
     
-    return theta[:, 0:sim_cfg['num_spline_knots']+1], x
+    return theta[:, 0:cfg.prior.num_knots+1], x
 
 
-def save_outputs(theta, x, config: dict, config_path: str, args):
-    
-    output_cfg = config['output']
-    
-    output_dir = Path(args.output_dir or output_cfg['directory'])
+def save_outputs(theta, x, cfg: OmegaConf, config_path: str, args):
+
+    output_dir = Path(args.output_dir or cfg.output.directory)
     
     if args.timestamp:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -117,8 +120,8 @@ def save_outputs(theta, x, config: dict, config_path: str, args):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Base filenames (without extension)
-    theta_base = output_cfg['theta_filename'].replace('.pt', '')
-    x_base = output_cfg['x_filename'].replace('.pt', '')
+    theta_base = cfg.output.theta_filename.replace('.pt', '')
+    x_base = cfg.output.x_filename.replace('.pt', '')
     
     if args.suffix:
         theta_base = f"{theta_base}_{args.suffix}"
@@ -187,7 +190,7 @@ def main():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     
     print(f"Loading config from: {config_path}")
-    config = load_config(config_path)
+    config = OmegaConf.load(config_path)
     
     # Generate simulations
     theta, x = generate_simulations(config, args)

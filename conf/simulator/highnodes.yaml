@@ -1,35 +1,33 @@
 # Prior bounds for all inferred parameters (12 total)
 prior:
   # Dynamics parameters
-  logD_lims: [-0.5, 2]       # log10 of diffusion coefficient
+  logD_lims: [-0.5, 1.0]
   
   # FRET parameters  
-  R0_lims: [6.0, 12.0]          # Förster radius
-  kD_lims: [0.1, 10.0]         # Donor excitation rate
+  R0_lims: [6.0, 12.0]
+  kD_lims: [0.1, 10.0]
   
   # Background rates
-  k_gb_lims: [0.0, 0.25]        # Green photon background rate
-  k_rb_lims: [0.0, 0.25]        # Red photon background rate
+  k_gb_lims: [0.0, 0.25]
+  k_rb_lims: [0.0, 0.25]
   
   # Detector efficiencies
-  eta_g_lims: [0.7, 1.0]       # Green detector quantum efficiency
-  eta_r_lims: [0.7, 1.0]       # Red detector quantum efficiency
+  eta_g_lims: [0.7, 1.0]      
+  eta_r_lims: [0.7, 1.0]
   
   # Cross-talk matrix (spectral bleed-through)
-  C_gg_lims: [0.8, 1.0]        # Prob green photon -> green detector
-  C_rr_lims: [0.8, 1.0]        # Prob red photon -> red detector
-  C_gr_lims: [0.0, 0.2]        # Prob green photon -> red detector
-  C_rg_lims: [0.0, 0.2]        # Prob red photon -> green detector
+  C_gg_lims: [0.8, 1.0]
+  C_rr_lims: [0.8, 1.0]
+  C_gr_lims: [0.0, 0.2]
+  C_rg_lims: [0.0, 0.2]
 
-  num_knots: 8                # number of spline knots for potential
-  spline_mean: null           # mean values for spline coefficients (default: zero)
+  num_knots: 8
+  spline_mean: null
   spline_scale: 5.0
   spline_correlation: 1
 
-
-# Fixed simulator parameters (not inferred)
 simulator:
-  total_time: 10000.0             
+  total_time: 20000.0             
   saving_frequency: 10000
   time_step: 5e-5
   spline_type: "cubic"
@@ -39,9 +37,8 @@ simulator:
   x_max: 14.0
   x_init: [4.0, 14.0]
 
-
 data_generation:
-  num_simulations: 500000       # number of simulations to generate
+  num_simulations: 250000       # number of simulations to generate
   num_workers: 80              # parallel workers for simulation
   batch_size: 100              # simulations per batch
 

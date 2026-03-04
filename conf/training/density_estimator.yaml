@@ -2,26 +2,22 @@
 defaults:
   - _self_
 
-# Training settings
 training:
-  batch_size: 512
+  batch_size: 128
   validation_fraction: 0.1
-  num_epochs: 150
+  num_epochs: 50
   compile: true
   grad_clip: 0.0
 
-# Optimizer settings
 optimizer:
   lr: 1e-3
   weight_decay: 0.01
 
-# Learning rate scheduler settings
 scheduler:
-  max_lr: 1e-3
+  max_lr: 5e-3
   pct_start: 0.3
   final_div_factor: 1e4
 
-# Embedding settings
 embedding:
   dim: 16
   dim_mults: [1, 2]
@@ -29,7 +25,6 @@ embedding:
   kernel_size: 32
   output_dim: 128
 
-# Normalizing flow settings
 flow:
   model: "maf"
   hidden_features: 128
@@ -38,13 +33,12 @@ flow:
   dropout_probability: 0.1
   use_batch_norm: false
 
-# Data settings
 data:
-  h5_path: "data/base/data.h5"  # gzip compressed - 8 workers handle decompression
-  chunk_size: 1000        # matches HDF5 chunk size for optimal I/O
-  chunk_step: 10          # load 10k samples per I/O operation
-  num_workers: 8          # parallel workers for decompression
-  prefetch_factor: 4  
+  data_dir: "data/base"
+  chunk_size: 512
+  chunk_step: 1
+  num_workers: 6
+  prefetch_factor: 3
   output_path: "npe_density_estimator.pkl"
  
 hydra:

@@ -1,7 +1,9 @@
+from functools import partial
 import torch
 import numpy as np
 from utils import make_spline_knots
 from smFRET_simulator import smFRET_simulator
+from omegaconf import OmegaConf
 
 def smFRET_simulator_wrapper(
                 params, 
@@ -54,3 +56,44 @@ def smFRET_simulator_wrapper(
         kG_photons = torch.from_numpy(kG_photons).float()
         kR_photons = torch.from_numpy(kR_photons).float()
         return torch.stack([kG_photons, kR_photons], dim=1)
+
+
+def smFRET_simulator_wrapper_from_config(cfg: str):
+    """
+    Generate a smFRET simulator wrapper from a configuration file or dict.
+    
+    Expected config structure:
+        simulator:
+            total_time: 5000.0
+            saving_frequency: 2000
+            time_step: 5e-4
+            spline_type: "cubic"
+            boundary_condition: "bound"
+    """
+
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+
+    total_time = cfg.simulator.total_time
+    saving_frequency = cfg.simulator.saving_frequency
+    time_step = cfg.simulator.time_step
+    spline_type = cfg.simulator.spline_type
+    boundary_condition = cfg.simulator.boundary_condition
+    num_knots = cfg.prior.num_knots
+    max_G0 = cfg.simulator.max_G0
+    x_min = cfg.simulator.x_min
+    x_max = cfg.simulator.x_max
+    x_init = tuple(cfg.simulator.x_init)
+
+    return partial(
+        smFRET_simulator_wrapper,
+        dt=time_step,
+        saving_freq=saving_frequency,
+        T=total_time,
+        x_init=x_init,
+        x_min=x_min,
+        x_max=x_max,
+        num_knots=num_knots,
+        max_G0=max_G0,
+        boundary_condition=boundary_condition,
+        spline_type=spline_type
+    )

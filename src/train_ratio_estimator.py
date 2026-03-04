@@ -72,18 +72,20 @@ def train(cfg: DictConfig) -> float:
 
     # Load data (use absolute path from original working directory)
     orig_cwd = hydra.utils.get_original_cwd()
-    
-    # Check if using lazy HDF5 loading (for large datasets)
-    use_lazy_loading = getattr(cfg.data, 'h5_path', None) is not None
-    
-    if use_lazy_loading:
+    data_dir = Path(orig_cwd) / cfg.data.data_dir
+
+    # Auto-detect data format from folder contents
+    h5_files = sorted(data_dir.glob("*.h5"))
+    pt_files = sorted(data_dir.glob("*.pt"))
+
+    if h5_files:
         # Efficient HDF5 streaming with H5Dataset
-        h5_path = Path(orig_cwd) / cfg.data.h5_path
+        h5_path = h5_files[0]
         chunk_size = getattr(cfg.data, 'chunk_size', 1000)
         chunk_step = getattr(cfg.data, 'chunk_step', 10)
         batch_size = cfg.training.batch_size
         
-        log.info(f"Using H5Dataset from: {h5_path}")
+        log.info(f"Auto-detected HDF5 data: {h5_path}")
         log.info(f"  chunk_size={chunk_size}, chunk_step={chunk_step}")
         log.info(f"  Samples loaded per iteration: {chunk_size * chunk_step}")
         
@@ -151,10 +153,11 @@ def train(cfg: DictConfig) -> float:
         # Calculate steps per epoch for scheduler
         steps_per_epoch = len(train_dataset) // batch_size
         
-    else:
+    elif pt_files:
         # Traditional loading - load entire dataset into RAM
-        theta = torch.load(Path(orig_cwd) / cfg.data.theta_path, weights_only=True)
-        x = torch.load(Path(orig_cwd) / cfg.data.x_path, weights_only=True)
+        theta = torch.load(data_dir / "theta.pt", weights_only=True)
+        x = torch.load(data_dir / "x.pt", weights_only=True)
+        log.info(f"Auto-detected PT data in: {data_dir}")
         
         num_examples = theta.size(0)
         theta_init = theta[:100, :]
@@ -182,6 +185,8 @@ def train(cfg: DictConfig) -> float:
             sampler=SubsetRandomSampler(val_indices),
         )
         steps_per_epoch = len(train_loader)
+    else:
+        raise ValueError(f"No .h5 or .pt files found in {data_dir}")
 
     ratio_estimator = neural_ratio(theta_init, x_init)
     ratio_estimator.to(device)
@@ -258,7 +263,8 @@ def train(cfg: DictConfig) -> float:
         epoch_time = time.time() - epoch_start
 
         # Logging
-        total_norm = torch.norm(torch.stack([p.grad.detach().norm(2) for p in ratio_estimator.parameters() if p.grad is not None])).cpu().item()
+        grad_norms = [p.grad.detach().norm(2) for p in ratio_estimator.parameters() if p.grad is not None]
+        total_norm = torch.norm(torch.stack(grad_norms)).cpu().item() if grad_norms else 0.0
         writer.add_scalar("Norm/Grad_Norm", total_norm, epoch)
         writer.add_scalar("Loss/train", train_loss_avg, epoch)
         writer.add_scalar("Loss/val", val_loss, epoch)

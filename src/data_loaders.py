@@ -101,7 +101,7 @@ class H5Dataset(IterableDataset):
             self._chunk_list = list(chunk_indices)
         else:
             self._chunk_list = list(range(self._num_total_chunks))
-        
+
         # Calculate length based on assigned chunks
         self._len = 0
         for ci in self._chunk_list:
@@ -110,9 +110,8 @@ class H5Dataset(IterableDataset):
             self._len += (end - start)
     
     def _get_file(self) -> h5py.File:
-        """Lazy file handle (reopened per worker process)."""
         if self._file is None:
-            self._file = h5py.File(self.file_path, 'r')
+            self._file = h5py.File(self.file_path, 'r', swmr=True, libver='latest')
         return self._file
     
     def __len__(self) -> int:
@@ -186,9 +185,9 @@ class H5Dataset(IterableDataset):
                 yield from zip(theta, x)
             else:
                 for tb, xb in zip(theta.split(self.batch_size), x.split(self.batch_size)):
-                    if self.drop_last and len(tb) < self.batch_size:
-                        continue
-                    yield tb, xb
+                        if self.drop_last and len(tb) < self.batch_size:
+                            continue
+                        yield tb, xb
     
     def __del__(self):
         if self._file is not None:

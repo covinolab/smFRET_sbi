@@ -23,6 +23,7 @@ __pycache__/
 sbi-logs/
 data/
 output/
+outputs/
 
 # Pytorch and Pickle files
 *.pt

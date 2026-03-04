@@ -35,7 +35,7 @@ classifier:
 
 # Data settings
 data:
-  h5_path: "data/base/data.h5"  # gzip compressed - 8 workers handle decompression
+  data_dir: "data/base"
   chunk_size: 1000        # matches HDF5 chunk size for optimal I/O
   chunk_step: 10          # load 10k samples per I/O operation
   num_workers: 8          # parallel workers for decompression

@@ -87,6 +87,8 @@ def generate_spline_fret_prior(
         spline_mean = torch.zeros(num_knots, device=device)
 
     spline_cov = make_covariance_matrix(num_knots, spline_scale, spline_correlation, device)
+    spline_cov = spline_cov.to(device)
+    spline_mean = spline_mean.to(device)
     prior_spline = dists.MultivariateNormal(loc=spline_mean, covariance_matrix=spline_cov)
     
     # Photophysics priors (uniform)
@@ -149,7 +151,7 @@ def generate_spline_fret_prior(
     return MultipleIndependent(priors)
 
 
-def generate_spline_fret_prior_from_config(
+def generate_fret_prior_from_config(
     cfg: OmegaConf, 
     device: str = "cpu"
 ) -> Union[MultipleIndependent]:
@@ -206,3 +208,38 @@ def generate_spline_fret_prior_from_config(
         spline_correlation=cfg.prior.spline_correlation,
         device=device
     )
+
+
+def generate_posterior_prior_from_config(cfg: str, device: str = "cpu") -> MultipleIndependent:
+    """
+    Generate a prior for posterior sampling from config.
+    
+    This is a wrapper around generate_fret_prior_from_config that ensures the returned
+    distribution is always a MultipleIndependent, which is required for some inference algorithms.
+    
+    Args:
+        cfg: Config with 'prior' section defining the FRET prior parameters.
+        device: Device for tensors.
+
+    Returns:
+        MultipleIndependent distribution representing the FRET prior.
+    """
+
+    cfg = OmegaConf.load(cfg)
+
+    prior_logD = dists.Uniform(
+        torch.tensor([cfg.prior.logD_lims[0]], device=device),
+        torch.tensor([cfg.prior.logD_lims[1]], device=device)
+    )
+
+    # Prior on spline parameters (correlated Gaussian)
+    if cfg.prior.spline_mean is not None:
+        spline_mean = torch.tensor(cfg.prior.spline_mean)
+        spline_mean = spline_mean - spline_mean.mean()  # Normalize to zero mean
+    else:
+        spline_mean = torch.zeros(cfg.prior.num_knots)
+
+    spline_cov = make_covariance_matrix(cfg.prior.num_knots, cfg.prior.spline_scale, cfg.prior.spline_correlation, device)
+    prior_spline = dists.MultivariateNormal(loc=spline_mean.to(device), covariance_matrix=spline_cov.to(device))
+
+    return MultipleIndependent([prior_logD, prior_spline], device=device)

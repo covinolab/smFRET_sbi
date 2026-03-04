@@ -29,8 +29,8 @@ prior:
 
 # Fixed simulator parameters (not inferred)
 simulator:
-  total_time: 1000.0             
-  saving_frequency: 1000
+  total_time: 5000.0             
+  saving_frequency: 2000
   time_step: 5e-4
   spline_type: "cubic"
   boundary_condition: "bound"
@@ -43,7 +43,7 @@ simulator:
 data_generation:
   num_simulations: 1000       # number of simulations to generate
   num_workers: 24              # parallel workers for simulation
-  batch_size: 1              # simulations per batch
+  batch_size: 10              # simulations per batch
 
 output:
   directory: ./data/test            # output directory for training data

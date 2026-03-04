@@ -30,7 +30,7 @@ prior:
 # Fixed simulator parameters (not inferred)
 simulator:
   total_time: 10000.0             
-  saving_frequency: 1000
+  saving_frequency: 10000
   time_step: 5e-5
   spline_type: "cubic"
   boundary_condition: "bound"

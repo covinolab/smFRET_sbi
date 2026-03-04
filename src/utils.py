@@ -1,5 +1,7 @@
+from functools import partial
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from gsl_spline import spline
 
 def make_spline_knots(
@@ -40,6 +42,9 @@ def eval_spline(
         max_G0, 
         spline_type="cubic"
     ):
+
+    if isinstance(params, torch.Tensor):
+        params = params.detach().cpu().numpy()
     
     x_knots, y_knots = make_spline_knots(
         params=params,
@@ -53,3 +58,15 @@ def eval_spline(
     y = spline(x_knots, y_knots, x_eval, spline_type=spline_type)
 
     return x_eval, y
+
+
+def eval_spline_from_config(cfg):
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+    return partial(eval_spline,
+        N_knots=cfg.prior.num_knots,
+        x_min=cfg.simulator.x_min,
+        x_max=cfg.simulator.x_max,
+        boundary_condition=cfg.simulator.boundary_condition,
+        max_G0=cfg.simulator.max_G0,
+        spline_type=cfg.simulator.spline_type
+    )

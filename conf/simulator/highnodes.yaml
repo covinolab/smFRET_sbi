@@ -38,11 +38,11 @@ simulator:
   x_init: [4.0, 14.0]
 
 data_generation:
-  num_simulations: 250000       # number of simulations to generate
+  num_simulations: 200000       # number of simulations to generate
   num_workers: 80              # parallel workers for simulation
   batch_size: 100              # simulations per batch
 
 output:
-  directory: ./data/base            # output directory for training data
+  directory: ./data/highnodes            # output directory for training data
   theta_filename: theta.pt     # filename for parameter tensor
   x_filename: x.pt             # filename for observation tensor

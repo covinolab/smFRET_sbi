@@ -1,7 +1,7 @@
 # Prior bounds for all inferred parameters (12 total)
 prior:
   # Dynamics parameters
-  logD_lims: [-0.5, 1.0]
+  logD_lims: [-0.5, 0.5]
   
   # FRET parameters  
   R0_lims: [6.0, 12.0]
@@ -32,17 +32,16 @@ simulator:
   time_step: 5e-5
   spline_type: "cubic"
   boundary_condition: "bound"
-  max_G0: 30.0
+  max_G0: 10.0
   x_min: 4.0
   x_max: 14.0
   x_init: [4.0, 14.0]
 
 data_generation:
-  num_simulations: 250000       # number of simulations to generate
+  num_simulations: 200000       # number of simulations to generate
   num_workers: 80              # parallel workers for simulation
   batch_size: 100              # simulations per batch
+  chunk_size: 32      
 
 output:
-  directory: ./data/highnodes            # output directory for training data
-  theta_filename: theta.pt     # filename for parameter tensor
-  x_filename: x.pt             # filename for observation tensor
+  directory: ./data/highnodes            # output directory for training datas

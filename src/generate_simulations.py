@@ -54,13 +54,13 @@ def _worker_simulate_batch(batch_theta):
     return len(results_theta)
 
 
-def _writer_process(h5_path, num_simulations, theta_dim, x_shape, batch_size, in_queue, done_queue):
+def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size, in_queue, done_queue):
     """
     Dedicated writer process: keeps HDF5 file open for the entire run
     and appends batches received via the queue.
     """
-    theta_chunks = (max(1, min(batch_size, num_simulations)), theta_dim)
-    x_chunks = (max(1, min(batch_size, num_simulations)),) + x_shape
+    theta_chunks = (max(1, min(chunk_size, num_simulations)), theta_dim)
+    x_chunks = (max(1, min(chunk_size, num_simulations)),) + x_shape
 
     idx = 0
 
@@ -154,15 +154,15 @@ def parse_args():
         help="Override output directory from config",
     )
     parser.add_argument(
-        "--suffix",
-        type=str,
-        default=None,
-        help="Add suffix to output filenames (e.g., 'small' -> data_small.h5)",
-    )
-    parser.add_argument(
         "--timestamp",
         action="store_true",
         help="Add timestamp to output directory name",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="HDF5 chunk size (number of samples per chunk). Defaults to batch_size.",
     )
     parser.add_argument(
         "--format", "-f",
@@ -221,6 +221,7 @@ def generate_simulations(cfg, args):
     num_simulations = args.num_simulations or cfg.data_generation.num_simulations
     num_workers = args.num_workers or cfg.data_generation.num_workers
     batch_size = cfg.data_generation.batch_size
+    chunk_size = args.chunk_size or cfg.data_generation.chunk_size
     theta_dim = cfg.prior.num_knots + 1
 
     prior = generate_fret_prior_from_config(cfg, device="cpu")
@@ -237,8 +238,7 @@ def generate_simulations(cfg, args):
         output_dir = output_dir / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    suffix = f"_{args.suffix}" if args.suffix else ""
-    h5_path = str(output_dir / f"data{suffix}.h5")
+    h5_path = str(output_dir / "data.h5")
 
     # ── Sample parameters from the prior ──
     print(f"Sampling {num_simulations} parameter sets from prior...")
@@ -258,7 +258,7 @@ def generate_simulations(cfg, args):
 
     writer = mp.Process(
         target=_writer_process,
-        args=(h5_path, num_simulations, theta_dim, x_shape, batch_size,
+        args=(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
               out_queue, done_queue),
         daemon=False,
     )
@@ -311,16 +311,10 @@ def generate_simulations(cfg, args):
 
     # ── Optionally export .pt copies ──
     if args.format in ("pt", "both"):
-        theta_base = cfg.output.theta_filename.replace(".pt", "")
-        x_base = cfg.output.x_filename.replace(".pt", "")
-        if args.suffix:
-            theta_base = f"{theta_base}_{args.suffix}"
-            x_base = f"{x_base}_{args.suffix}"
-
         with h5py.File(h5_path, "r") as f:
-            torch.save(torch.from_numpy(f["theta"][:]), output_dir / f"{theta_base}.pt")
-            torch.save(torch.from_numpy(f["x"][:]), output_dir / f"{x_base}.pt")
-        print(f"  Saved {theta_base}.pt and {x_base}.pt")
+            torch.save(torch.from_numpy(f["theta"][:]), output_dir / "theta.pt")
+            torch.save(torch.from_numpy(f["x"][:]), output_dir / "x.pt")
+        print("  Saved theta.pt and x.pt")
 
     if args.format == "pt":
         Path(h5_path).unlink()
@@ -344,7 +338,6 @@ def save_metadata(output_dir, cfg, config_path, args, actual_count, h5_path):
             "num_simulations": args.num_simulations,
             "num_workers": args.num_workers,
             "output_dir": args.output_dir,
-            "suffix": args.suffix,
             "format": args.format,
         },
     }

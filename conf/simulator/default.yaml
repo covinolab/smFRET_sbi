@@ -1,7 +1,7 @@
 # Prior bounds for all inferred parameters (12 total)
 prior:
   # Dynamics parameters
-  logD_lims: [-0.5, 2]       # log10 of diffusion coefficient
+  logD_lims: [-0.5, 2.0]       # log10 of diffusion coefficient
   
   # FRET parameters  
   R0_lims: [6.0, 12.0]          # Förster radius
@@ -41,7 +41,7 @@ simulator:
 
 
 data_generation:
-  num_simulations: 500000       # number of simulations to generate
+  num_simulations: 200000       # number of simulations to generate
   num_workers: 80              # parallel workers for simulation
   batch_size: 100              # simulations per batch
 

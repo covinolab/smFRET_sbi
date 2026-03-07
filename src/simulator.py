@@ -16,7 +16,8 @@ def smFRET_simulator_wrapper(
                 num_knots=10,
                 max_G0=10.0,
                 boundary_condition='diffusive',
-                spline_type="cubic"
+                spline_type="cubic",
+                return_torch=False
     ):
             
         x_init = np.random.uniform(low=x_init[0], high=x_init[1])
@@ -53,9 +54,12 @@ def smFRET_simulator_wrapper(
         if kG_photons is None or kR_photons is None:
             return None
 
-        kG_photons = torch.from_numpy(kG_photons).float()
-        kR_photons = torch.from_numpy(kR_photons).float()
-        return torch.stack([kG_photons, kR_photons], dim=1)
+        if return_torch:
+            kG_photons = torch.from_numpy(kG_photons).float()
+            kR_photons = torch.from_numpy(kR_photons).float()
+            return torch.stack([kG_photons, kR_photons], dim=1)
+
+        return np.stack([kG_photons, kR_photons], axis=1).astype(np.float32)
 
 
 def smFRET_simulator_wrapper_from_config(cfg: str):
@@ -95,5 +99,6 @@ def smFRET_simulator_wrapper_from_config(cfg: str):
         num_knots=num_knots,
         max_G0=max_G0,
         boundary_condition=boundary_condition,
-        spline_type=spline_type
+        spline_type=spline_type,
+        return_torch=True
     )

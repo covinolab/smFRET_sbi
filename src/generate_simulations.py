@@ -15,27 +15,25 @@ from priors import generate_fret_prior_from_config
 
 
 # ─── Worker globals (initialised once per pool worker by _init_worker) ───────
-_worker_lock = None
-_worker_h5_path = None
 _worker_sim_fn = None
 _worker_theta_dim = None
+_worker_out_queue = None
 
 
-def _init_worker(lock, h5_path, sim_kwargs, theta_dim):
+def _init_worker(out_queue, sim_kwargs, theta_dim):
     """Set up shared state for each pool worker."""
-    global _worker_lock, _worker_h5_path, _worker_sim_fn, _worker_theta_dim
-    _worker_lock = lock
-    _worker_h5_path = h5_path
+    global _worker_sim_fn, _worker_theta_dim, _worker_out_queue
     _worker_theta_dim = theta_dim
+    _worker_out_queue = out_queue
     _worker_sim_fn = partial(fret_simulator, **sim_kwargs)
-    # Give each worker a unique random seed so simulations are independent
     np.random.seed(os.getpid() % (2**32))
+    torch.set_num_threads(1)  # prevent OpenMP deadlocks in forked workers
 
 
-def _worker_simulate_batch_and_write(batch_theta):
+def _worker_simulate_batch(batch_theta):
     """
-    Worker function: simulate a batch of parameters and write the results
-    directly into the shared HDF5 file (one lock-protected write per batch).
+    Worker function: simulate a batch, put results on an unbounded queue,
+    and return only a tiny count (avoids large-result pipe deadlocks).
     """
     results_theta = []
     results_x = []
@@ -43,30 +41,84 @@ def _worker_simulate_batch_and_write(batch_theta):
     for i in range(len(batch_theta)):
         x = _worker_sim_fn(batch_theta[i])
         if x is not None:
-            results_theta.append(batch_theta[i][:_worker_theta_dim])
+            results_theta.append(batch_theta[i][:_worker_theta_dim].numpy())
             results_x.append(x)
 
     if not results_theta:
         return 0
 
-    thetas = torch.stack(results_theta)
-    xs = torch.stack(results_x)
+    thetas = np.stack(results_theta)
+    xs = np.stack(results_x)
 
-    # ── Acquire lock and write directly into the HDF5 file ──
-    with _worker_lock:
-        with h5py.File(
-            _worker_h5_path, "a",
-            libver="latest",
-            rdcc_nbytes=64 * 1024 * 1024,  # 64 MB chunk cache
-            rdcc_nslots=521,
-        ) as f:
-            idx = int(f.attrs["write_idx"])
-            n = len(thetas)
-            f["theta"][idx : idx + n] = thetas.numpy()
-            f["x"][idx : idx + n] = xs.numpy()
-            f.attrs["write_idx"] = idx + n
+    _worker_out_queue.put((thetas, xs))
+    return len(results_theta)
 
-    return n
+
+def _writer_process(h5_path, num_simulations, theta_dim, x_shape, batch_size, in_queue, done_queue):
+    """
+    Dedicated writer process: keeps HDF5 file open for the entire run
+    and appends batches received via the queue.
+    """
+    theta_chunks = (max(1, min(batch_size, num_simulations)), theta_dim)
+    x_chunks = (max(1, min(batch_size, num_simulations)),) + x_shape
+
+    idx = 0
+
+    with h5py.File(h5_path, "w", libver="latest") as f:
+        f.create_dataset(
+            "theta",
+            shape=(num_simulations, theta_dim),
+            maxshape=(num_simulations, theta_dim),
+            dtype="float32",
+            chunks=theta_chunks,
+            compression="gzip",
+            compression_opts=1,
+            shuffle=True,
+        )
+        f.create_dataset(
+            "x",
+            shape=(num_simulations,) + x_shape,
+            maxshape=(num_simulations,) + x_shape,
+            dtype="float32",
+            chunks=x_chunks,
+            compression="gzip",
+            compression_opts=1,
+            shuffle=True,
+        )
+
+        while True:
+            item = in_queue.get()
+
+            if item is None:          # sentinel → all workers done
+                break
+
+            theta_np, x_np = item
+            n = theta_np.shape[0]
+
+            f["theta"][idx : idx + n] = theta_np
+            f["x"][idx : idx + n] = x_np
+
+            idx += n
+            print(
+                f"\r  Writing: {idx}/{num_simulations} written",
+                end="",
+                flush=True,
+            )
+
+        print()
+
+        # Trim if some simulations returned None
+        if idx < num_simulations:
+            f["theta"].resize(idx, axis=0)
+            f["x"].resize(idx, axis=0)
+
+        f.attrs["write_idx"] = idx
+        f.attrs["num_simulations"] = idx
+        f.attrs["generated_at"] = datetime.now().isoformat()
+        f.attrs["theta_shape"] = list(f["theta"].shape)
+        f.attrs["x_shape"] = list(f["x"].shape)
+
+    done_queue.put(idx)
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -153,40 +205,17 @@ def _determine_output_shape(sim_kwargs, prior, max_attempts=100):
     )
 
 
-def _compress_h5(src_path, dst_path, compression="gzip", compression_opts=1):
-    """
-    Copy an uncompressed HDF5 file into a new compressed one.
-    This is much faster than compressing on every batch write because
-    compression runs in a single sequential pass over contiguous data.
-    """
-    with h5py.File(src_path, "r") as fin, h5py.File(dst_path, "w", libver="latest") as fout:
-        for key in fin:
-            data = fin[key]
-            chunks = (min(512, data.shape[0]),) + data.shape[1:]
-            fout.create_dataset(
-                key,
-                data=data[:],
-                chunks=chunks,
-                compression=compression,
-                compression_opts=compression_opts,
-            )
-        # Copy attributes
-        for attr_key, attr_val in fin.attrs.items():
-            fout.attrs[attr_key] = attr_val
-
-
 # ─── Main generation routine ────────────────────────────────────────────────
 def generate_simulations(cfg, args):
     """
-    Generate simulations with each worker writing directly into HDF5.
+    Generate simulations using a queue-based writer pattern.
 
     Workflow
     --------
-    1. Pre-allocate an HDF5 file with datasets of the correct shape.
-    2. Sample all parameter sets from the prior (small memory footprint).
-    3. Distribute batches to a multiprocessing pool.
-    4. Each worker simulates its batch and writes results straight into the
-       HDF5 file (guarded by a shared lock).
+    1. Start a dedicated writer process that owns the HDF5 file.
+    2. Sample all parameter sets from the prior.
+    3. Workers simulate batches and push results to a queue.
+    4. The writer drains the queue and writes sequentially (no lock needed).
     5. Trim datasets if some simulations returned None.
     """
     num_simulations = args.num_simulations or cfg.data_generation.num_simulations
@@ -211,89 +240,74 @@ def generate_simulations(cfg, args):
     suffix = f"_{args.suffix}" if args.suffix else ""
     h5_path = str(output_dir / f"data{suffix}.h5")
 
-    # ── Pre-allocate HDF5 datasets (uncompressed for fast writes) ──
-    # Align chunk size to batch_size so each write fills whole chunks
-    # and avoids expensive read-modify-write cycles on partial chunks.
-    theta_chunks = (min(batch_size, num_simulations), theta_dim)
-    x_chunks = (min(batch_size, num_simulations),) + x_shape
-
-    with h5py.File(h5_path, "w", libver="latest") as f:
-        f.create_dataset(
-            "theta",
-            shape=(num_simulations, theta_dim),
-            maxshape=(num_simulations, theta_dim),
-            dtype="float32",
-            chunks=theta_chunks,
-            # No compression during writes — compress in a final pass
-        )
-        f.create_dataset(
-            "x",
-            shape=(num_simulations,) + x_shape,
-            maxshape=(num_simulations,) + x_shape,
-            dtype="float32",
-            chunks=x_chunks,
-            # No compression during writes — compress in a final pass
-        )
-        f.attrs["write_idx"] = 0
-
     # ── Sample parameters from the prior ──
     print(f"Sampling {num_simulations} parameter sets from prior...")
     all_theta = prior.sample((num_simulations,))
 
-    # Split into worker batches
     num_batches = (num_simulations + batch_size - 1) // batch_size
     batches = [
         all_theta[i * batch_size : min((i + 1) * batch_size, num_simulations)]
         for i in range(num_batches)
     ]
 
+    # ── Start the dedicated writer process ──
+    # No maxsize — workers never block on put(), avoiding deadlock.
+    # Memory is bounded: at most num_batches items in flight (~few hundred MB).
+    out_queue = mp.Queue()
+    done_queue = mp.Queue(maxsize=1)
+
+    writer = mp.Process(
+        target=_writer_process,
+        args=(h5_path, num_simulations, theta_dim, x_shape, batch_size,
+              out_queue, done_queue),
+        daemon=False,
+    )
+    writer.start()
+
     # ── Run simulations ──
     print(
         f"Starting {num_simulations} simulations with {num_workers} workers "
         f"(batch_size={batch_size}, {num_batches} batches)..."
     )
-    manager = mp.Manager()
-    lock = manager.Lock()
+    # Print expected data sizes
+    single_x_bytes = 4  # float32
+    for d in x_shape:
+        single_x_bytes *= d
+    batch_x_mb = (single_x_bytes * batch_size) / (1024 * 1024)
+    print(f"  x_shape={x_shape}, per-batch result size ~{batch_x_mb:.1f} MB", flush=True)
 
-    total_written = 0
-    with mp.Pool(
+    total_simulated = 0
+    pool = mp.Pool(
         num_workers,
         initializer=_init_worker,
-        initargs=(lock, h5_path, sim_kwargs, theta_dim),
-    ) as pool:
-        for count in pool.imap_unordered(
-            _worker_simulate_batch_and_write, batches
-        ):
-            total_written += count
-            print(
-                f"\r  Progress: {total_written}/{num_simulations} written",
-                end="",
-                flush=True,
-            )
+        initargs=(out_queue, sim_kwargs, theta_dim),
+    )
+    for count in pool.imap_unordered(_worker_simulate_batch, batches):
+        total_simulated += count
+        print(
+            f"\r  Progress: {total_simulated}/{num_simulations} simulated",
+            end="",
+            flush=True,
+        )
+
+    pool.close()
+    pool.join()
 
     print()
 
-    # ── Finalise the HDF5 file ──
-    with h5py.File(h5_path, "a") as f:
-        actual_count = int(f.attrs["write_idx"])
-        if actual_count < num_simulations:
-            print(
-                f"  Note: {num_simulations - actual_count} simulations failed, "
-                f"resizing datasets to {actual_count}"
-            )
-            f["theta"].resize(actual_count, axis=0)
-            f["x"].resize(actual_count, axis=0)
-        f.attrs["num_simulations"] = actual_count
-        f.attrs["generated_at"] = datetime.now().isoformat()
-        f.attrs["theta_shape"] = list(f["theta"].shape)
-        f.attrs["x_shape"] = list(f["x"].shape)
+    # Signal writer to finish, then wait
+    out_queue.put(None)
+    writer.join()
+    if writer.exitcode != 0:
+        raise RuntimeError(f"Writer process failed with exit code {writer.exitcode}")
 
-    # ── Compress the final file ──
-    compressed_path = h5_path.replace(".h5", "_compressed.h5")
-    print(f"  Compressing {h5_path} -> {compressed_path} ...")
-    _compress_h5(h5_path, compressed_path)
-    os.replace(compressed_path, h5_path)
-    print(f"  HDF5 file written: {h5_path}  ({actual_count} simulations, gzip)")
+    actual_count = int(done_queue.get())
+    if actual_count < num_simulations:
+        print(
+            f"  Note: {num_simulations - actual_count} simulations failed, "
+            f"trimmed to {actual_count}"
+        )
+    print(f"  HDF5 file written: {h5_path}  ({actual_count} simulations, gzip level 1)")
 
     # ── Optionally export .pt copies ──
     if args.format in ("pt", "both"):
@@ -308,7 +322,6 @@ def generate_simulations(cfg, args):
             torch.save(torch.from_numpy(f["x"][:]), output_dir / f"{x_base}.pt")
         print(f"  Saved {theta_base}.pt and {x_base}.pt")
 
-    # If the user only wanted .pt, remove the intermediate HDF5
     if args.format == "pt":
         Path(h5_path).unlink()
         h5_path = None

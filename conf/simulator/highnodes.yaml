@@ -28,7 +28,7 @@ prior:
 
 simulator:
   total_time: 20000.0             
-  saving_frequency: 10000
+  saving_frequency: 5000
   time_step: 5e-5
   spline_type: "cubic"
   boundary_condition: "bound"
@@ -38,7 +38,7 @@ simulator:
   x_init: [4.0, 14.0]
 
 data_generation:
-  num_simulations: 200000       # number of simulations to generate
+  num_simulations: 250000       # number of simulations to generate
   num_workers: 80              # parallel workers for simulation
   batch_size: 100              # simulations per batch
 

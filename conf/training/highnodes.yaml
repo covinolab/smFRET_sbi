@@ -1,0 +1,52 @@
+
+defaults:
+  - _self_
+
+training:
+  batch_size: 512
+  validation_fraction: 0.1
+  num_epochs: 75
+  compile: true
+  grad_clip: 0.0
+
+optimizer:
+  lr: 1e-3
+  weight_decay: 0.01
+
+scheduler:
+  max_lr: 1e-3
+  pct_start: 0.3
+  final_div_factor: 1e4
+
+embedding:
+  dim: 64
+  dim_mults: [1, 2, 4]
+  attention: True
+  kernel_size: 64
+  output_dim: 128
+
+flow:
+  model: "maf_rqs"
+  hidden_features: 128
+  num_transforms: 5
+  num_blocks: 3
+  dropout_probability: 0.15
+  use_batch_norm: false
+
+data:
+  data_dir: "data/highnodes"
+  chunk_size: 512
+  chunk_step: 1
+  num_workers: 6
+  prefetch_factor: 3
+  output_path: "npe_density_estimator.pkl"
+ 
+hydra:
+  run:
+    dir: outputs/density_estimator/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/density_estimator/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false  # Stay in original directory
+

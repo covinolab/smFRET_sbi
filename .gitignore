@@ -4,6 +4,7 @@
 *.jpg
 *.npy
 .vscode/
+todo.txt
 
 !figure.png
 
@@ -15,6 +16,14 @@ __pycache__/
 # C extensions and generated C code !!!
 *.so
 *.c
+
+conf/simulator/*.yaml
+!conf/simulator/default.yaml
+!conf/simulator/test.yaml
+
+conf/training/*.yaml
+!conf/training/density_estimator.yaml
+!conf/training/test.yaml
 
 # output files
 *.out

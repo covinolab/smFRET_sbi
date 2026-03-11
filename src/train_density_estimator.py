@@ -11,7 +11,6 @@ from omegaconf import DictConfig
 import torch
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils import data
-from torch.utils.data.sampler import SubsetRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from sbi import utils as utils
@@ -25,6 +24,30 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 log = logging.getLogger(__name__)
+
+
+def save_checkpoint(path, epoch, model, optimizer, scheduler,
+                    best_val_loss, best_model_state_dict):
+    """Save a resumable training checkpoint."""
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'best_model_state_dict': best_model_state_dict,
+    }, path)
+    log.info(f"Checkpoint saved: epoch {epoch}, best_val={best_val_loss:.4f}, path={path}")
+
+
+def load_checkpoint(path, model, optimizer, scheduler, device):
+    """Load checkpoint and return (start_epoch, best_val_loss, best_model_state_dict)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['model_state_dict'])
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    log.info(f"Resumed from checkpoint: epoch {ckpt['epoch']}, best_val={ckpt['best_val_loss']:.4f}, path={path}")
+    return ckpt['epoch'], ckpt['best_val_loss'], ckpt['best_model_state_dict']
 
 
 def setup_ddp():
@@ -88,134 +111,88 @@ def train(cfg: DictConfig) -> float:
     orig_cwd = hydra.utils.get_original_cwd()
     data_dir = Path(orig_cwd) / cfg.data.data_dir
 
-    # Auto-detect data format from folder contents
+    # Load HDF5 data
     h5_files = sorted(data_dir.glob("*.h5"))
-    pt_files = sorted(data_dir.glob("*.pt"))
+    if not h5_files:
+        raise FileNotFoundError(f"No .h5 files found in {data_dir}")
 
-    if h5_files:
-        # Efficient HDF5 streaming with H5Dataset
-        h5_path = h5_files[0]
-        chunk_size = getattr(cfg.data, 'chunk_size', 256)
-        chunk_step = getattr(cfg.data, 'chunk_step', 256)
-        batch_size = cfg.training.batch_size
-        
-        log.info(f"Auto-detected HDF5 data: {h5_path}")
-        log.info(f"  chunk_size={chunk_size}, chunk_step={chunk_step}")
-        log.info(f"  Samples loaded per iteration: {chunk_size * chunk_step}")
-        
-        # Get dataset info and init samples
-        temp_dataset = H5Dataset(h5_path)
-        num_examples = len(temp_dataset)
-        theta_init, x_init = temp_dataset[:100]
-        del temp_dataset
-        
-        # Split by CHUNKS (not random indices) for fast contiguous I/O
-        num_chunks = (num_examples + chunk_size - 1) // chunk_size
-        num_train_chunks = int((1 - cfg.training.validation_fraction) * num_chunks)
-        
-        # Shuffle chunk assignment, then split (fixed seed for consistent split across DDP ranks)
-        g = torch.Generator().manual_seed(42)
-        chunk_perm = torch.randperm(num_chunks, generator=g).tolist()
-        train_chunk_indices = chunk_perm[:num_train_chunks]
-        val_chunk_indices = chunk_perm[num_train_chunks:]
+    h5_path = h5_files[0]
+    chunk_size = cfg.data.chunk_size
+    chunk_step = cfg.data.chunk_step
+    batch_size = cfg.training.batch_size
 
-        # Partition chunks across DDP ranks
-        if ddp:
-            rank, world_size = dist.get_rank(), dist.get_world_size()
-            train_chunk_indices = train_chunk_indices[rank::world_size]
-            val_chunk_indices = val_chunk_indices[rank::world_size]
+    log.info(f"HDF5 data: {h5_path}")
+    log.info(f"  chunk_size={chunk_size}, chunk_step={chunk_step}")
+    log.info(f"  Samples loaded per iteration: {chunk_size * chunk_step}")
 
-        log.info(f"  Split: {len(train_chunk_indices)} train chunks, {len(val_chunk_indices)} val chunks (this rank)")
-        
-        # Create train/val datasets with chunk-based splitting
-        train_dataset = H5Dataset(
-            h5_path,
-            batch_size=batch_size,
-            chunk_size=chunk_size,
-            chunk_step=chunk_step,
-            shuffle=True,
-            chunk_indices=train_chunk_indices,
-            drop_last=True,
-        )
-        val_dataset = H5Dataset(
-            h5_path,
-            batch_size=batch_size,
-            chunk_size=chunk_size,
-            chunk_step=chunk_step,
-            shuffle=False,
-            chunk_indices=val_chunk_indices,
-        )
-        
-        # Wrap in DataLoader with workers for prefetching
-        num_workers = getattr(cfg.data, 'num_workers', 4)
-        prefetch_factor = getattr(cfg.data, 'prefetch_factor', 2)
-        
-        log.info(f"  Workers: {num_workers}, prefetch_factor: {prefetch_factor}")
-        
-        # IterableDataset yields batches, so set batch_size=None
-        train_loader = data.DataLoader(
-            train_dataset,
-            batch_size=None,  # H5Dataset yields batches internally
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
-        )
-        val_loader = data.DataLoader(
-            val_dataset,
-            batch_size=None,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
-        )
+    # Get dataset info and init samples
+    temp_dataset = H5Dataset(h5_path)
+    num_examples = len(temp_dataset)
+    theta_init, x_init = temp_dataset[:100]
+    del temp_dataset
 
-        # Calculate steps per epoch for scheduler
-        steps_per_epoch = len(train_loader) // batch_size
-        
-    elif pt_files:
-        # Traditional loading - load entire dataset into RAM
-        theta = torch.load(data_dir / "theta.pt", weights_only=True)
-        x = torch.load(data_dir / "x.pt", weights_only=True)
-        log.info(f"Auto-detected PT data in: {data_dir}")
-        
-        dataset = data.TensorDataset(theta, x)
-        num_examples = theta.size(0)
-        theta_init = theta[:10, :]
-        x_init = x[:10, :]
-        
-        # Train/val split
-        num_training_examples = int((1 - cfg.training.validation_fraction) * num_examples)
-        num_validation_examples = num_examples - num_training_examples
-        g = torch.Generator().manual_seed(42)
-        permuted_indices = torch.randperm(num_examples, generator=g)
-        train_indices = permuted_indices[:num_training_examples]
-        val_indices = permuted_indices[num_training_examples:]
+    # Split by CHUNKS (not random indices) for fast contiguous I/O
+    num_chunks = (num_examples + chunk_size - 1) // chunk_size
+    num_train_chunks = int((1 - cfg.training.validation_fraction) * num_chunks)
 
-        # Partition indices across DDP ranks
-        if ddp:
-            rank, world_size = dist.get_rank(), dist.get_world_size()
-            train_indices = train_indices[rank::world_size]
-            val_indices = val_indices[rank::world_size]
+    # Shuffle chunk assignment, then split (fixed seed for consistent split across DDP ranks)
+    g = torch.Generator().manual_seed(42)
+    chunk_perm = torch.randperm(num_chunks, generator=g).tolist()
+    train_chunk_indices = chunk_perm[:num_train_chunks]
+    val_chunk_indices = chunk_perm[num_train_chunks:]
 
-        train_indices = train_indices.tolist()
-        val_indices = val_indices.tolist()
-        
-        train_loader = data.DataLoader(
-            dataset,
-            batch_size=min(cfg.training.batch_size, num_training_examples),
-            drop_last=True,
-            sampler=SubsetRandomSampler(train_indices),
-        )
-        val_loader = data.DataLoader(
-            dataset,
-            batch_size=min(cfg.training.batch_size, num_validation_examples),
-            drop_last=True,
-            sampler=SubsetRandomSampler(val_indices),
-        )
-        steps_per_epoch = len(train_loader)
-    else:
-        raise ValueError(f"No .h5 or .pt files found in {data_dir}")
+    # Partition chunks across DDP ranks
+    if ddp:
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        train_chunk_indices = train_chunk_indices[rank::world_size]
+        val_chunk_indices = val_chunk_indices[rank::world_size]
+
+    log.info(f"  Split: {len(train_chunk_indices)} train chunks, {len(val_chunk_indices)} val chunks (this rank)")
+
+    # Create train/val datasets with chunk-based splitting
+    train_dataset = H5Dataset(
+        h5_path,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        chunk_step=chunk_step,
+        shuffle=True,
+        chunk_indices=train_chunk_indices,
+        drop_last=True,
+    )
+    val_dataset = H5Dataset(
+        h5_path,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        chunk_step=chunk_step,
+        shuffle=False,
+        chunk_indices=val_chunk_indices,
+    )
+
+    # Wrap in DataLoader with workers for prefetching
+    num_workers = cfg.data.num_workers
+    prefetch_factor = cfg.data.prefetch_factor
+
+    log.info(f"  Workers: {num_workers}, prefetch_factor: {prefetch_factor}")
+
+    train_loader = data.DataLoader(
+        train_dataset,
+        batch_size=None,  # H5Dataset yields batches internally
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+    )
+    val_loader = data.DataLoader(
+        val_dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+    )
+
+    # Calculate steps per epoch for scheduler
+    steps_per_epoch = len(train_loader) // batch_size
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
@@ -258,16 +235,36 @@ def train(cfg: DictConfig) -> float:
 
     best_val_loss = float("Inf")
     best_model_state_dict = None
+    start_epoch = 0
 
     # Get Hydra output directory
     hydra_output_dir = Path(HydraConfig.get().runtime.output_dir)
 
+    # Resume from checkpoint if configured
+    resume_path = cfg.training.resume_from
+    if resume_path:
+        resume_path = Path(resume_path)
+        if not resume_path.is_absolute():
+            resume_path = Path(orig_cwd) / resume_path
+        if resume_path.exists():
+            start_epoch, best_val_loss, best_model_state_dict = load_checkpoint(
+                resume_path, density_estimator, optimizer, scheduler, device
+            )
+        else:
+            log.warning(f"Checkpoint not found at {resume_path}, starting from scratch")
+
+    # Time-based checkpointing
+    ckpt_interval_min = cfg.training.checkpoint_interval_minutes
+    last_ckpt_time = time.time()
+
     # TensorBoard logging (in Hydra output directory) — only on rank 0
     if is_main_process():
-        writer = SummaryWriter(log_dir=hydra_output_dir / "tensorboard")
+        writer = SummaryWriter(log_dir=hydra_output_dir / "tensorboard", flush_secs=30)
         log.info(f"TensorBoard logs: {hydra_output_dir / 'tensorboard'}")
+        if ckpt_interval_min > 0:
+            log.info(f"Time-based checkpointing every {ckpt_interval_min} min")
 
-    for epoch in range(1, cfg.training.num_epochs + 1):
+    for epoch in range(start_epoch + 1, cfg.training.num_epochs + 1):
         epoch_start = time.time()
         
         # Training
@@ -339,6 +336,7 @@ def train(cfg: DictConfig) -> float:
             remaining_epochs = cfg.training.num_epochs - epoch
             estimated_remaining_time = elapsed_time * remaining_epochs
             log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
+            writer.flush()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -347,6 +345,16 @@ def train(cfg: DictConfig) -> float:
             if is_main_process():
                 with open(hydra_output_dir / "last_density_estimator.pkl", "wb") as f:
                     pickle.dump(density_estimator, f)
+
+        # Time-based checkpoint (rank 0 only)
+        if is_main_process() and ckpt_interval_min > 0:
+            if (time.time() - last_ckpt_time) / 60.0 >= ckpt_interval_min:
+                save_checkpoint(
+                    hydra_output_dir / "checkpoint.pt",
+                    epoch, density_estimator, optimizer, scheduler,
+                    best_val_loss, best_model_state_dict,
+                )
+                last_ckpt_time = time.time()
 
     # Save and log only on rank 0
     if is_main_process():
@@ -382,10 +390,11 @@ def train(cfg: DictConfig) -> float:
         with open(output_path, "wb") as f:
             pickle.dump(density_estimator, f)
 
-        # delete last model checkpoint (if it exists)
-        last_checkpoint_path = hydra_output_dir / "last_density_estimator.pkl"
-        if last_checkpoint_path.exists():
-            last_checkpoint_path.unlink()
+        # Clean up intermediate files after successful completion
+        for tmp_name in ["last_density_estimator.pkl", "checkpoint.pt"]:
+            tmp_path = hydra_output_dir / tmp_name
+            if tmp_path.exists():
+                tmp_path.unlink()
 
         log.info(f"\nBest val loss: {best_val_loss:.4f}")
         log.info(f"Saved model to {output_path}")

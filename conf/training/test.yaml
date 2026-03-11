@@ -8,6 +8,8 @@ training:
   num_epochs: 50
   compile: true
   grad_clip: 0.0
+  checkpoint_interval_minutes: 0.1
+  resume_from: null
 
 optimizer:
   lr: 1e-3
@@ -37,6 +39,10 @@ flow:
 data:
   data_dir: "data/test"
   output_path: "npe_density_estimator.pkl"
+  chunk_size: 512
+  chunk_step: 1
+  num_workers: 6
+  prefetch_factor: 3
  
 hydra:
   run:

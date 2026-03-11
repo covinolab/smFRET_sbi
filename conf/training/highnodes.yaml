@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 training:
-  batch_size: 512
+  batch_size: 256
   validation_fraction: 0.1
   num_epochs: 75
   compile: true
@@ -20,9 +20,9 @@ scheduler:
 
 embedding:
   dim: 64
-  dim_mults: [1, 2, 4]
+  dim_mults: [1, 2]
   attention: True
-  kernel_size: 64
+  kernel_size: 3
   output_dim: 128
 
 flow:
@@ -35,7 +35,7 @@ flow:
 
 data:
   data_dir: "data/highnodes"
-  chunk_size: 512
+  chunk_size: 256
   chunk_step: 1
   num_workers: 6
   prefetch_factor: 3

@@ -20,15 +20,15 @@ scheduler:
 
 embedding:
   dim: 16
-  dim_mults: [1, 2]
+  dim_mults: [1]
   attention: False
-  kernel_size: 32
-  output_dim: 128
+  kernel_size: 8
+  output_dim: 16
 
 flow:
   model: "maf"
-  hidden_features: 128
-  num_transforms: 3
+  hidden_features: 32
+  num_transforms: 1
   num_blocks: 2
   dropout_probability: 0.1
   use_batch_norm: false

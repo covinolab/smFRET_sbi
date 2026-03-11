@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import time
 import logging
+from xml.parsers.expat import model
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -82,6 +83,8 @@ def train(cfg: DictConfig) -> float:
             "use_batch_norm": cfg.flow.use_batch_norm,
         }
     )
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # Load data (use absolute path from original working directory)
     orig_cwd = hydra.utils.get_original_cwd()
@@ -218,6 +221,7 @@ def train(cfg: DictConfig) -> float:
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
+    print(f"Model parameters: {count_parameters(density_estimator):,}")
 
     # Wrap in DDP: route loss() through forward() for gradient synchronization
     if ddp:

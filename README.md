@@ -154,23 +154,6 @@ Use the notebooks in `analysis/` to load trained models and inspect posteriors o
 - `eval_posterior.ipynb` — sample and visualise the posterior
 - `setup_prior.ipynb` — inspect and configure priors
 
-## Architecture
-
-The observation encoder is a **1-D temporal CNN** (`TemporalCNN`) that maps variable-length two-channel photon traces to a fixed-size embedding vector. It uses residual blocks with GroupNorm, Mish activations, and strided downsampling.
-
-This embedding feeds into a **Masked Autoregressive Flow (MAF)** for density estimation (NPE).
-
-### Default Training Configuration
-
-| Hyperparameter | Default |
-|----------------|---------|
-| Batch size | 128 |
-| Epochs | 50 |
-| Learning rate | 1×10⁻³ (OneCycleLR, peak 5×10⁻³) |
-| Embedding dim | 16, mults [1, 2], output 128 |
-| Flow | MAF, 3 transforms, 128 hidden, 2 blocks |
-| Dropout | 0.1 |
-
 ## Data Loading
 
 `H5Dataset` (iterable PyTorch dataset) streams data from HDF5 with chunk-aligned contiguous reads. Chunks are partitioned across DataLoader workers for parallel decompression.

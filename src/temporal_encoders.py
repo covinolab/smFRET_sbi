@@ -96,6 +96,28 @@ class LinearAttention(nn.Module):
         out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
         out = einops.rearrange(out, 'b h c d -> b (h c) d')
         return self.to_out(out)
+    
+class StatsPool(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        # mean + std + min + max + 3 quantiles = 7
+        self.proj = nn.Sequential(
+            nn.Linear(dim * 7, dim),
+            nn.Mish(),
+        )
+
+    def forward(self, x):
+        # x: [batch, channels, time]
+        stats = [
+            x.mean(dim=-1),
+            x.std(dim=-1),
+            x.min(dim=-1).values,
+            x.max(dim=-1).values,
+            x.quantile(0.25, dim=-1),
+            x.quantile(0.50, dim=-1),
+            x.quantile(0.75, dim=-1),
+        ]
+        return self.proj(torch.cat(stats, dim=-1))
 
 class ResidualTemporalBlock(nn.Module):
 
@@ -156,8 +178,7 @@ class TemporalCNN(nn.Module):
         self.mid_block1 = ResidualTemporalBlock(mid_dim, mid_dim, kernel_size = kernel_size, padding_mode=padding_mode)
         self.mid_attn = Residual(PreNorm(mid_dim, LinearAttention(mid_dim))) if attention else nn.Identity()
         self.mid_block2 = ResidualTemporalBlock(mid_dim, mid_dim, kernel_size = kernel_size, padding_mode=padding_mode)
-
-        self.proj_out = nn.Linear(mid_dim, output_dim)
+        self.pool = StatsPool(mid_dim)
 
     def forward(self, x):
         '''
@@ -174,6 +195,5 @@ class TemporalCNN(nn.Module):
         x = self.mid_block1(x)
         x = self.mid_attn(x)
         x = self.mid_block2(x)
-        x = x.mean(dim=-1)
-        x = self.proj_out(x)
+        x = self.pool(x)
         return x

@@ -72,8 +72,8 @@ The free-energy landscape is parameterised by spline knot values drawn from a co
 | `total_time` | 10 000 | Total simulation time |
 | `saving_frequency` | 10 000 | Photon binning window |
 | `time_step` | 5×10⁻⁵ | Integration time step |
-| `x_min` / `x_max` | 4.0 / 14.0 | Spatial domain bounds |
-| `boundary_condition` | `bound` | Reflecting boundaries |
+| `x_min` / `x_max` | 4.0 / 14.0 | Position of first and last knot |
+| `boundary_condition` | `bound` | Constraining Boundaries |
 
 ## Installation
 

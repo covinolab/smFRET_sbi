@@ -262,7 +262,7 @@ def train(cfg: DictConfig) -> float:
         writer = SummaryWriter(log_dir=hydra_output_dir / "tensorboard", flush_secs=30)
         log.info(f"TensorBoard logs: {hydra_output_dir / 'tensorboard'}")
         if ckpt_interval_min > 0:
-            log.info(f"Time-based checkpointing every {ckpt_interval_min} min")
+            log.info(f"Checkpointing every {ckpt_interval_min} min")
 
     for epoch in range(start_epoch + 1, cfg.training.num_epochs + 1):
         epoch_start = time.time()

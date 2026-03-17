@@ -132,7 +132,7 @@ def parse_args():
     parser.add_argument(
         "--config", "-c",
         type=str,
-        default="conf/simulator/default.yaml",
+        required=True,
         help="Path to YAML configuration file",
     )
     parser.add_argument(
@@ -144,8 +144,8 @@ def parse_args():
     parser.add_argument(
         "--num-workers", "-w",
         type=int,
-        default=None,
-        help="Override number of workers from config",
+        required=True,
+        help="Number of parallel worker processes for simulation",
     )
     parser.add_argument(
         "--output-dir", "-o",

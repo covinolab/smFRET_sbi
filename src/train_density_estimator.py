@@ -1,9 +1,10 @@
 import pickle
+import shutil
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 import time
 import logging
-from xml.parsers.expat import model
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -24,6 +25,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 log = logging.getLogger(__name__)
+
+
+def _git_commit(repo_dir: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
 
 
 def save_checkpoint(path, epoch, model, optimizer, scheduler,
@@ -124,6 +135,14 @@ def train(cfg: DictConfig) -> float:
     log.info(f"HDF5 data: {h5_path}")
     log.info(f"  chunk_size={chunk_size}, chunk_step={chunk_step}")
     log.info(f"  Samples loaded per iteration: {chunk_size * chunk_step}")
+
+    data_config = sorted(data_dir.glob("config.yaml"))
+    if data_config:
+        log.info(f"  Found data config: {data_config[0]}")
+        hydra_output_dir = Path(HydraConfig.get().runtime.output_dir)
+        (hydra_output_dir / ".hydra/data_conf.yaml").write_text(data_config[0].read_text())
+    else:
+        log.warning(f"  No config.yaml found in {data_dir}, proceeding without data config")
 
     # Get dataset info and init samples
     temp_dataset = H5Dataset(h5_path)
@@ -240,6 +259,21 @@ def train(cfg: DictConfig) -> float:
     # Get Hydra output directory
     hydra_output_dir = Path(HydraConfig.get().runtime.output_dir)
 
+    if is_main_process():
+        log.info("=" * 60)
+        log.info(f"git commit : {_git_commit(Path(orig_cwd))}")
+        log.info(f"run dir    : {hydra_output_dir.resolve()}")
+        log.info(f"data dir   : {data_dir.resolve()}")
+        log.info(f"config     : {HydraConfig.get().job.config_name}")
+        log.info(f"overrides  : {list(HydraConfig.get().overrides.task)}")
+        log.info("=" * 60)
+        data_cfg = data_dir / "config.yaml"
+        if data_cfg.exists():
+            shutil.copy2(data_cfg, hydra_output_dir / "data_config.yaml")
+            log.info(f"Copied dataset config -> {hydra_output_dir / 'data_config.yaml'}")
+        else:
+            log.warning(f"No config.yaml found in {data_dir}; skipping data config copy")
+
     # Resume from checkpoint if configured
     resume_path = cfg.training.resume_from
     if resume_path:
@@ -343,14 +377,14 @@ def train(cfg: DictConfig) -> float:
             best_model_state_dict = deepcopy(density_estimator.state_dict())
 
             if is_main_process():
-                with open(hydra_output_dir / "last_density_estimator.pkl", "wb") as f:
+                with open(hydra_output_dir / f"last_{cfg.artifacts.model_filename}", "wb") as f:
                     pickle.dump(density_estimator, f)
 
         # Time-based checkpoint (rank 0 only)
         if is_main_process() and ckpt_interval_min > 0:
             if (time.time() - last_ckpt_time) / 60.0 >= ckpt_interval_min:
                 save_checkpoint(
-                    hydra_output_dir / "checkpoint.pt",
+                    hydra_output_dir / cfg.artifacts.checkpoint_filename,
                     epoch, density_estimator, optimizer, scheduler,
                     best_val_loss, best_model_state_dict,
                 )
@@ -386,12 +420,12 @@ def train(cfg: DictConfig) -> float:
 
         # Save best model (in Hydra output directory)
         density_estimator.load_state_dict(best_model_state_dict)
-        output_path = hydra_output_dir / "density_estimator.pkl"
+        output_path = hydra_output_dir / cfg.artifacts.model_filename
         with open(output_path, "wb") as f:
             pickle.dump(density_estimator, f)
 
         # Clean up intermediate files after successful completion
-        for tmp_name in ["last_density_estimator.pkl", "checkpoint.pt"]:
+        for tmp_name in [f"last_{cfg.artifacts.model_filename}", cfg.artifacts.checkpoint_filename]:
             tmp_path = hydra_output_dir / tmp_name
             if tmp_path.exists():
                 tmp_path.unlink()

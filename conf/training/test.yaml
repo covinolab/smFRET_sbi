@@ -38,11 +38,15 @@ flow:
 # Data settings
 data:
   data_dir: "data/test"
-  output_path: "npe_density_estimator.pkl"
   chunk_size: 512
   chunk_step: 1
   num_workers: 6
   prefetch_factor: 3
+
+artifacts:
+  model_filename: "npe_density_estimator.pkl"
+  checkpoint_filename: "checkpoint.pt"
+  data_config_copy_filename: "data_config.yaml"
  
 hydra:
   run:

@@ -42,13 +42,13 @@ smFRET_sbi/
 └── README.md
 ```
 
-> **Note:** Only `default.yaml` and `test.yaml` configs are tracked in git. Experiment-specific config variants (e.g. `highnodes.yaml`) are gitignored — Hydra logs the full resolved config in each run's output directory.
+> **Note:** Only `default.yaml` and `test.yaml` configs are tracked in git. Experiment-specific config variants (e.g. `experiment.yaml`) are gitignored — Hydra logs the full resolved config in each run's output directory.
 
 ## Simulator
 
 The core simulator (`smFRET_simulator.pyx`) integrates Langevin dynamics on a spline-defined free-energy potential and produces two-channel (green/red) photon count traces:
 
-1. **Dynamics** — Overdamped Langevin equation: $dx = D \, F(x) \, dt + \sqrt{2D \, dt}\;\eta$, where $F(x) = -dU/dx$ is the force derived from a cubic-spline potential $U(x)$.
+1. **Dynamics** — Overdamped Langevin where the force derived from potential $U(x)$ parametirzed by  cubic spline interpolation. (dx = -D * dU/dx * dt + sqrt(2D*dt)*N(0,1))
 2. **FRET efficiency** — $E(r) = R_0^6 / (R_0^6 + r^6)$.
 3. **Photon detection** — Poisson-distributed photon counts with cross-talk, background, and quantum-efficiency corrections.
 

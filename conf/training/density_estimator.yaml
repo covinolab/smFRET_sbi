@@ -7,7 +7,7 @@ training:
   validation_fraction: 0.1
   num_epochs: 50
   compile: true
-  grad_clip: 0.0
+  grad_clip: 10.0
   checkpoint_interval_minutes: 30
   resume_from: null
 
@@ -28,7 +28,7 @@ embedding:
   output_dim: 128
 
 flow:
-  model: "maf"
+  model: "maf_rqs"
   hidden_features: 128
   num_transforms: 3
   num_blocks: 2
@@ -41,7 +41,11 @@ data:
   chunk_step: 1
   num_workers: 6
   prefetch_factor: 3
-  output_path: "npe_density_estimator.pkl"
+
+artifacts:
+  model_filename: "npe_density_estimator.pkl"
+  checkpoint_filename: "checkpoint.pt"
+  data_config_copy_filename: "data_config.yaml"
  
 hydra:
   run:

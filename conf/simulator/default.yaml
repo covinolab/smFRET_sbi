@@ -42,7 +42,6 @@ simulator:
 
 data_generation:
   num_simulations: 200000       # number of simulations to generate
-  num_workers: 80              # parallel workers for simulation
   batch_size: 100              # simulations per batch
   chunk_size: 128              # HDF5 chunk size (samples per chunk)
 

@@ -86,6 +86,9 @@ def get_device():
         return torch.device("cuda:0")
     return torch.device("cpu")
 
+def count_model_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 
 @hydra.main(version_base=None, config_path="../conf/training", config_name="density_estimator")
 def train(cfg: DictConfig) -> float:
@@ -212,10 +215,8 @@ def train(cfg: DictConfig) -> float:
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    log.info(f"Total trainable parameters: {count_parameters(density_estimator):,}")
+    log.info(f"Total trainable parameters: {count_model_parameters(density_estimator):,}")
 
     # Wrap in DDP: route loss() through forward() for gradient synchronization
     if ddp:

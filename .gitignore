@@ -3,6 +3,8 @@
 *.pdf
 *.jpg
 *.npy
+*.sh
+*.csv
 .vscode/
 todo.txt
 

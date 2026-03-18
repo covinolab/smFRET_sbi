@@ -1,14 +1,15 @@
 
 defaults:
+  - embedding: cnn
   - _self_
 
 training:
   batch_size: 128
   validation_fraction: 0.1
   num_epochs: 50
-  compile: true
+  compile: false
   grad_clip: 0.0
-  checkpoint_interval_minutes: 0.1
+  checkpoint_interval_minutes: 2
   resume_from: null
 
 optimizer:
@@ -23,8 +24,9 @@ scheduler:
 embedding:
   dim: 16
   dim_mults: [1]
-  attention: False
+  attention: false
   kernel_size: 8
+  padding_mode: reflect
   output_dim: 16
 
 flow:
@@ -38,9 +40,9 @@ flow:
 # Data settings
 data:
   data_dir: "data/test"
-  chunk_size: 512
+  chunk_size: 128
   chunk_step: 1
-  num_workers: 6
+  num_workers: 2
   prefetch_factor: 3
 
 artifacts:

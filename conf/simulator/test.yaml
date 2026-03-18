@@ -30,7 +30,7 @@ prior:
 # Fixed simulator parameters (not inferred)
 simulator:
   total_time: 5000.0             
-  saving_frequency: 500
+  saving_frequency: 1500
   time_step: 5e-4
   spline_type: "cubic"
   boundary_condition: "bound"
@@ -41,8 +41,8 @@ simulator:
 
 
 data_generation:
-  num_simulations: 1000       # number of simulations to generate
-  batch_size: 10              # simulations per batch
+  num_simulations: 12800       # number of simulations to generate
+  batch_size: 16              # simulations per batch
   chunk_size: 128              # HDF5 chunk size (samples per chunk)
 
 output:

@@ -1,9 +1,10 @@
 
 defaults:
+  - embedding: cnn
   - _self_
 
 training:
-  batch_size: 128
+  batch_size: 32
   validation_fraction: 0.1
   num_epochs: 50
   compile: true
@@ -21,10 +22,11 @@ scheduler:
   final_div_factor: 1e4
 
 embedding:
-  dim: 16
+  dim: 8
   dim_mults: [1, 2]
-  attention: False
-  kernel_size: 32
+  attention: false
+  kernel_size: 7
+  padding_mode: reflect
   output_dim: 128
 
 flow:

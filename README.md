@@ -145,6 +145,21 @@ Override any config value from the command line:
 python src/train_density_estimator.py training.num_epochs=300 embedding.output_dim=256
 ```
 
+Select a different temporal encoder (CNN / Transformer) and tune only that encoder's hyperparameters:
+
+```bash
+# Transformer encoder
+python src/train_density_estimator.py embedding=transformer embedding.depth=6 embedding.num_heads=8
+
+# CNN encoder
+python src/train_density_estimator.py embedding=cnn embedding.dim=16 embedding.kernel_size=9
+```
+
+Encoder configs live in `conf/training/embedding/` (Hydra config group):
+
+- `embedding=cnn` with `embedding.*` CNN hyperparameters
+- `embedding=transformer` with `embedding.*` Transformer hyperparameters
+
 Training logs are written to TensorBoard under the Hydra output directory (`outputs/density_estimator/<date>/<time>/`).
 
 ### 3. Evaluate

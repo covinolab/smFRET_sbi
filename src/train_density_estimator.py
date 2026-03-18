@@ -8,7 +8,7 @@ import logging
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import torch
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils import data
@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sbi import utils as utils
 from sbi.neural_nets import posterior_nn
 
-from temporal_encoders import TemporalCNN
+from temporal_encoders import build_temporal_encoder
 from data_loaders import H5Dataset
 
 import os
@@ -93,31 +93,6 @@ def train(cfg: DictConfig) -> float:
     ddp = setup_ddp()
     device = get_device()
 
-    # Build embedding network
-    cnn = TemporalCNN(
-        transition_dim=2,
-        dim=cfg.embedding.dim,
-        dim_mults=tuple(cfg.embedding.dim_mults),
-        attention=cfg.embedding.attention,
-        padding_mode='reflect',
-        kernel_size=cfg.embedding.kernel_size,
-        output_dim=cfg.embedding.output_dim
-    )
-
-    # Build normalizing flow
-    neural_posterior = posterior_nn(
-        model=cfg.flow.model,
-        z_score_x='none',
-        hidden_features=cfg.flow.hidden_features,
-        num_transforms=cfg.flow.num_transforms,
-        embedding_net=cnn,
-        kwargs={
-            "num_blocks": cfg.flow.num_blocks,
-            "dropout_probability": cfg.flow.dropout_probability,
-            "use_batch_norm": cfg.flow.use_batch_norm,
-        }
-    )
-
     # Load data (use absolute path from original working directory)
     orig_cwd = hydra.utils.get_original_cwd()
     data_dir = Path(orig_cwd) / cfg.data.data_dir
@@ -148,12 +123,34 @@ def train(cfg: DictConfig) -> float:
     temp_dataset = H5Dataset(h5_path)
     num_examples = len(temp_dataset)
     theta_init, x_init = temp_dataset[:100]
+    max_len = x_init.shape[1]
     del temp_dataset
+
+    # Build embedding network (CNN / Transformer)
+    encoder = build_temporal_encoder(
+        cfg_embedding=cfg.embedding,
+        transition_dim=2,
+        max_len=max_len
+    )
+
+    # Build normalizing flow
+    neural_posterior = posterior_nn(
+        model=cfg.flow.model,
+        z_score_x='none',
+        hidden_features=cfg.flow.hidden_features,
+        num_transforms=cfg.flow.num_transforms,
+        embedding_net=encoder,
+        kwargs={
+            "num_blocks": cfg.flow.num_blocks,
+            "dropout_probability": cfg.flow.dropout_probability,
+            "use_batch_norm": cfg.flow.use_batch_norm,
+        }
+    )
 
     # Split by CHUNKS (not random indices) for fast contiguous I/O
     num_chunks = (num_examples + chunk_size - 1) // chunk_size
     num_train_chunks = int((1 - cfg.training.validation_fraction) * num_chunks)
-
+    
     # Shuffle chunk assignment, then split (fixed seed for consistent split across DDP ranks)
     g = torch.Generator().manual_seed(42)
     chunk_perm = torch.randperm(num_chunks, generator=g).tolist()
@@ -215,6 +212,10 @@ def train(cfg: DictConfig) -> float:
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    log.info(f"Total trainable parameters: {count_parameters(density_estimator):,}")
 
     # Wrap in DDP: route loss() through forward() for gradient synchronization
     if ddp:
@@ -399,11 +400,8 @@ def train(cfg: DictConfig) -> float:
             "max_lr": cfg.scheduler.max_lr,
             "batch_size": cfg.training.batch_size,
             "num_epochs": cfg.training.num_epochs,
-            "dim": cfg.embedding.dim,
-            "dim_mults": str(list(cfg.embedding.dim_mults)),
-            "attention": cfg.embedding.attention,
-            "kernel_size": cfg.embedding.kernel_size,
-            "output_dim": cfg.embedding.output_dim,
+            "embedding_name": str(getattr(cfg.embedding, "name", "cnn")),
+            "embedding_cfg": OmegaConf.to_yaml(cfg.embedding),
             "hidden_features": cfg.flow.hidden_features,
             "model": cfg.flow.model,
             "num_transforms": cfg.flow.num_transforms,

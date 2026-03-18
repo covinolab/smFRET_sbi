@@ -1,0 +1,9 @@
+name: transformer
+dim: 32
+kernel_sizes: [4, 4]
+stride: 2
+num_heads: 4
+depth: 4
+mlp_dim: 128
+dropout: 0.1
+output_dim: 128

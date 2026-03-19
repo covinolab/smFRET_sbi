@@ -116,6 +116,48 @@ class H5Dataset(IterableDataset):
     
     def __len__(self) -> int:
         return self._len
+
+    def num_batches(self, num_workers: int = 1) -> int:
+        """Return number of batches yielded in one full epoch.
+
+        This mirrors the current iteration behavior, including:
+        - worker chunk partitioning (round-robin)
+        - chunk grouping via ``chunk_step``
+        - batch splitting with optional ``drop_last``
+
+        Parameters
+        ----------
+        num_workers : int
+            Number of DataLoader workers used with this dataset.
+        """
+        if num_workers < 1:
+            raise ValueError("num_workers must be >= 1")
+
+        total_batches = 0
+
+        for worker_id in range(num_workers):
+            worker_chunks = [
+                c for i, c in enumerate(self._chunk_list)
+                if i % num_workers == worker_id
+            ]
+
+            for i in range(0, len(worker_chunks), self.chunk_step):
+                group_chunks = worker_chunks[i:i + self.chunk_step]
+
+                group_samples = 0
+                for ci in group_chunks:
+                    start = ci * self.chunk_size
+                    end = min(start + self.chunk_size, self._total_len)
+                    group_samples += (end - start)
+
+                if self.batch_size is None:
+                    total_batches += group_samples
+                elif self.drop_last:
+                    total_batches += group_samples // self.batch_size
+                else:
+                    total_batches += (group_samples + self.batch_size - 1) // self.batch_size
+
+        return total_batches
     
     def __getitem__(self, i: Union[int, slice]) -> Tuple[Tensor, Tensor]:
         """Random access for initialization (uses contiguous reads)."""

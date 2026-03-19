@@ -219,7 +219,8 @@ def train(cfg: DictConfig) -> float:
 
     # Calculate steps per epoch for scheduler
     # train_loader already yields full batches (H5Dataset batches internally)
-    steps_per_epoch = len(train_loader)
+    steps_per_epoch = train_dataset.num_batches(num_workers=num_workers)
+    print(f"Calculated steps_per_epoch: {steps_per_epoch} vs expected: {len(train_dataset) // batch_size}")
     if steps_per_epoch <= 0:
         raise ValueError("train_loader has zero steps per epoch; cannot train or schedule LR")
 

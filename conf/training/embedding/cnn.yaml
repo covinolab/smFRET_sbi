@@ -4,4 +4,5 @@ dim_mults: [1, 2, 4]
 attention: true
 padding_mode: reflect
 kernel_size: 3
+downsample: 0
 output_dim: 128

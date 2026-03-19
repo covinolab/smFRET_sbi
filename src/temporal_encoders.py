@@ -152,16 +152,18 @@ class TemporalCNN(nn.Module):
         attention=True,
         padding_mode='reflect',
         kernel_size=3,
+        downsample=0,
         output_dim=1
     ):
         super().__init__()
 
+        self.downsample = nn.Conv1d(transition_dim, transition_dim, kernel_size=downsample, stride=downsample) if downsample > 0 else nn.Identity()
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+
         dims = [transition_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
         print(f'[ models/temporal ] Channel dimensions: {dims}')
-
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
@@ -187,6 +189,7 @@ class TemporalCNN(nn.Module):
             x : [ batch x horizon x transition ]
         '''
         x = einops.rearrange(x, 'b h t -> b t h')
+        x = self.downsample(x)
 
         for resnet, resnet2, attn, downsample in self.downs:
             x = resnet(x)
@@ -302,6 +305,7 @@ def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
             attention=bool(getattr(cnn_cfg, "attention", True)),
             padding_mode=str(getattr(cnn_cfg, "padding_mode", "reflect")),
             kernel_size=int(getattr(cnn_cfg, "kernel_size", 3)),
+            downsample=int(getattr(cnn_cfg, "downsample", 0)),
             output_dim=int(getattr(cnn_cfg, "output_dim", 128)),
         )
 

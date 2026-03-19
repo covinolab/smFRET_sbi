@@ -40,11 +40,12 @@ def _git_commit(repo_dir: Path) -> str:
 def save_checkpoint(path, epoch, model, optimizer, scheduler,
                     best_val_loss, best_model_state_dict):
     """Save a resumable training checkpoint."""
+    scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        'scheduler_state_dict': scheduler_state_dict,
         'best_val_loss': best_val_loss,
         'best_model_state_dict': best_model_state_dict,
     }, path)
@@ -56,7 +57,13 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    ckpt_scheduler_state = ckpt.get('scheduler_state_dict', None)
+    if scheduler is not None and ckpt_scheduler_state is not None:
+        scheduler.load_state_dict(ckpt_scheduler_state)
+    elif scheduler is not None and ckpt_scheduler_state is None:
+        log.warning("Checkpoint has no scheduler state, but scheduler is enabled in config.")
+    elif scheduler is None and ckpt_scheduler_state is not None:
+        log.info("Checkpoint contains scheduler state, but scheduler is disabled in config; ignoring scheduler state.")
     log.info(f"Resumed from checkpoint: epoch {ckpt['epoch']}, best_val={ckpt['best_val_loss']:.4f}, path={path}")
     return ckpt['epoch'], ckpt['best_val_loss'], ckpt['best_model_state_dict']
 
@@ -211,7 +218,10 @@ def train(cfg: DictConfig) -> float:
     )
 
     # Calculate steps per epoch for scheduler
-    steps_per_epoch = len(train_loader) // batch_size
+    # train_loader already yields full batches (H5Dataset batches internally)
+    steps_per_epoch = len(train_loader)
+    if steps_per_epoch <= 0:
+        raise ValueError("train_loader has zero steps per epoch; cannot train or schedule LR")
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
@@ -245,14 +255,25 @@ def train(cfg: DictConfig) -> float:
         lr=cfg.optimizer.lr
     )
 
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=cfg.scheduler.max_lr,
-        epochs=cfg.training.num_epochs,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=cfg.scheduler.pct_start,
-        final_div_factor=cfg.scheduler.final_div_factor,
-    )
+    scheduler_cfg = cfg.scheduler if "scheduler" in cfg and cfg.scheduler is not None else None
+    if scheduler_cfg is not None:
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=cfg.scheduler.max_lr,
+            epochs=cfg.training.num_epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=cfg.scheduler.pct_start,
+            final_div_factor=cfg.scheduler.final_div_factor,
+        )
+        scheduler_expected_total_steps = cfg.training.num_epochs * steps_per_epoch
+        scheduler_step_count = 0
+        log.info("Scheduler enabled from config: OneCycleLR")
+        log.info(f"Scheduler target steps: {scheduler_expected_total_steps} ({cfg.training.num_epochs} epochs x {steps_per_epoch} steps/epoch)")
+    else:
+        scheduler = None
+        scheduler_expected_total_steps = None
+        scheduler_step_count = 0
+        log.info(f"Scheduler not configured; using constant learning rate: {cfg.optimizer.lr}")
 
     best_val_loss = float("Inf")
     best_model_state_dict = None
@@ -277,7 +298,7 @@ def train(cfg: DictConfig) -> float:
             log.warning(f"No config.yaml found in {data_dir}; skipping data config copy")
 
     # Resume from checkpoint if configured
-    resume_path = cfg.training.resume_from
+    resume_path = cfg.training.resume_from if "resume_from" in cfg.training else None
     if resume_path:
         resume_path = Path(resume_path)
         if not resume_path.is_absolute():
@@ -286,11 +307,13 @@ def train(cfg: DictConfig) -> float:
             start_epoch, best_val_loss, best_model_state_dict = load_checkpoint(
                 resume_path, density_estimator, optimizer, scheduler, device
             )
+            if scheduler is not None:
+                scheduler_step_count = max(0, scheduler.last_epoch + 1)
         else:
             log.warning(f"Checkpoint not found at {resume_path}, starting from scratch")
 
     # Time-based checkpointing
-    ckpt_interval_min = cfg.training.checkpoint_interval_minutes
+    ckpt_interval_min = cfg.training.checkpoint_interval_minutes if "checkpoint_interval_minutes" in cfg.training else 0
     last_ckpt_time = time.time()
 
     # TensorBoard logging (in Hydra output directory) — only on rank 0
@@ -307,7 +330,9 @@ def train(cfg: DictConfig) -> float:
         density_estimator.train()
         train_loss_sum = 0
         train_samples = 0
+        local_train_steps = 0
         for theta_batch, x_batch in train_loader:
+            local_train_steps += 1
             theta_batch = theta_batch.to(device, non_blocking=True)
             x_batch = x_batch.to(device, non_blocking=True)
             optimizer.zero_grad()
@@ -322,10 +347,13 @@ def train(cfg: DictConfig) -> float:
             train_loss_sum += train_losses.sum().item()
             train_samples += theta_batch.size(0)
             train_loss.backward()
-            if cfg.training.grad_clip is not None and cfg.training.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(density_estimator.parameters(), max_norm=cfg.training.grad_clip)
+            grad_clip = cfg.training.grad_clip if "grad_clip" in cfg.training else None
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(density_estimator.parameters(), max_norm=grad_clip)
             optimizer.step()
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
+                scheduler_step_count += 1
 
         # Aggregate training loss across DDP ranks
         if ddp:
@@ -334,6 +362,17 @@ def train(cfg: DictConfig) -> float:
             train_loss_avg = (t[0] / t[1]).item() if t[1] > 0 else 0
         else:
             train_loss_avg = train_loss_sum / train_samples if train_samples > 0 else 0
+
+        # Check whether all DDP ranks performed same number of train steps
+        if ddp:
+            min_steps = torch.tensor(float(local_train_steps), device=device)
+            max_steps = torch.tensor(float(local_train_steps), device=device)
+            dist.all_reduce(min_steps, op=dist.ReduceOp.MIN)
+            dist.all_reduce(max_steps, op=dist.ReduceOp.MAX)
+            if is_main_process() and min_steps.item() != max_steps.item():
+                log.warning(
+                    f"DDP rank step mismatch detected in epoch {epoch}: min_steps={int(min_steps.item())}, max_steps={int(max_steps.item())}"
+                )
 
         # Validation
         density_estimator.eval()
@@ -371,7 +410,14 @@ def train(cfg: DictConfig) -> float:
             elapsed_time = time.time() - epoch_start
             remaining_epochs = cfg.training.num_epochs - epoch
             estimated_remaining_time = elapsed_time * remaining_epochs
-            log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
+            if scheduler is not None:
+                log.info(
+                    f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, "
+                    f"LRstep={scheduler_step_count}/{scheduler_expected_total_steps}, "
+                    f"lr={optimizer.param_groups[0]['lr']:.3e}, ETA: {estimated_remaining_time/60:.1f}min"
+                )
+            else:
+                log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
             writer.flush()
 
         if val_loss < best_val_loss:
@@ -394,14 +440,20 @@ def train(cfg: DictConfig) -> float:
 
     # Save and log only on rank 0
     if is_main_process():
+        if scheduler is not None and scheduler_expected_total_steps is not None and scheduler_step_count != scheduler_expected_total_steps:
+            log.warning(
+                f"Scheduler finished with unexpected step count: actual={scheduler_step_count}, "
+                f"expected={scheduler_expected_total_steps}"
+            )
+
         # Log hyperparameters
         hparams = {
             "optimizer_lr": cfg.optimizer.lr,
             "optimizer_weight_decay": cfg.optimizer.weight_decay,
-            "max_lr": cfg.scheduler.max_lr,
+            "max_lr": cfg.scheduler.max_lr if scheduler_cfg is not None else cfg.optimizer.lr,
             "batch_size": cfg.training.batch_size,
             "num_epochs": cfg.training.num_epochs,
-            "embedding_name": str(getattr(cfg.embedding, "name", "cnn")),
+            "embedding_name": str(cfg.embedding.name if "name" in cfg.embedding else "cnn"),
             "embedding_cfg": OmegaConf.to_yaml(cfg.embedding),
             "hidden_features": cfg.flow.hidden_features,
             "model": cfg.flow.model,

@@ -10,25 +10,23 @@ def make_spline_knots(
         x_max=10.0, 
         num_knots=10, 
         max_G0=10.0, 
+        num_boundary_knots=3,
         boundary_condition='bound'
     ):
-    
+
     knot_spacing = (x_max - x_min) / (num_knots - 1)
-    x_knots = np.linspace(x_min - 2 * knot_spacing, x_max + 2 * knot_spacing, num_knots + 4) # +4 for boundary nodes
-    y_knots = np.zeros(num_knots + 4) # +4 for boundary nodes
+    x_knots = np.linspace(x_min - num_boundary_knots * knot_spacing, x_max + num_boundary_knots * knot_spacing, num_knots + 2 * num_boundary_knots)
+    y_knots = np.zeros(num_knots + 2 * num_boundary_knots) # +4 for boundary nodes
+    for i in range(1, num_boundary_knots+1):
+        if boundary_condition == 'linear':
+            y_knots[-num_boundary_knots + i] = i * (max_G0 / num_boundary_knots) + params[num_knots]
+            y_knots[num_boundary_knots - i - 1 ] = i * (max_G0 / num_boundary_knots) + params[1]
+        
+        elif boundary_condition == 'quadratic':
+            y_knots[-num_boundary_knots + i - 1] = (i / num_boundary_knots)**2 * max_G0 + params[num_knots]
+            y_knots[num_boundary_knots - i] =  (i / num_boundary_knots)**2 * max_G0 + params[1]
 
-    if boundary_condition == 'diffusive':
-        y_knots[-1] = 0.0
-        y_knots[-2] = 0.0
-
-    elif boundary_condition == 'bound':
-        y_knots[-1] = 2 * max_G0 + params[num_knots]
-        y_knots[-2] = max_G0 + params[num_knots]
-    
-    y_knots[0] = 2 * max_G0 + params[1]
-    y_knots[1] = max_G0 + params[1]  
-
-    y_knots[2:-2] = params[1:1+num_knots]
+    y_knots[num_boundary_knots:-num_boundary_knots] = params[1:1+num_knots]
     return x_knots, y_knots
 
 
@@ -40,7 +38,8 @@ def eval_spline(
         x_max, 
         boundary_condition, 
         max_G0, 
-        spline_type="cubic"
+        spline_type="cubic",
+        num_boundary_knots=4
     ):
 
     if isinstance(params, torch.Tensor):
@@ -52,7 +51,8 @@ def eval_spline(
         x_max=x_max,
         num_knots=N_knots,
         max_G0=max_G0,
-        boundary_condition=boundary_condition
+        boundary_condition=boundary_condition,
+        num_boundary_knots=num_boundary_knots
     )
 
     y = spline(x_knots, y_knots, x_eval, spline_type=spline_type)
@@ -68,5 +68,6 @@ def eval_spline_from_config(cfg):
         x_max=cfg.simulator.x_max,
         boundary_condition=cfg.simulator.boundary_condition,
         max_G0=cfg.simulator.max_G0,
-        spline_type=cfg.simulator.spline_type
+        spline_type=cfg.simulator.spline_type,
+        num_boundary_knots=cfg.simulator.num_boundary_knots
     )

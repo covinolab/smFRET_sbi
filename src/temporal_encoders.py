@@ -293,6 +293,21 @@ class TemporalTransformer(nn.Module):
         return x
 
 
+def _resolve_transformer_kernel_sizes(tr_cfg):
+    if hasattr(tr_cfg, "kernel_sizes"):
+        kernel_sizes = getattr(tr_cfg, "kernel_sizes")
+        if isinstance(kernel_sizes, int):
+            return (int(kernel_sizes), int(kernel_sizes))
+        return tuple(int(kernel_size) for kernel_size in kernel_sizes)
+
+    # Backward-compatible fallback for older configs.
+    if hasattr(tr_cfg, "kernel_size"):
+        kernel_size = int(getattr(tr_cfg, "kernel_size"))
+        return (kernel_size, kernel_size)
+
+    return (4, 4)
+
+
 def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
     encoder_name = str(getattr(cfg_embedding, "name", "cnn")).lower()
 
@@ -315,7 +330,7 @@ def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
         return TemporalTransformer(
             transition_dim=transition_dim,
             dim=int(getattr(tr_cfg, "dim", 32)),
-            kernel_sizes=tuple(getattr(tr_cfg, "kernel_sizes", [4, 4])),
+            kernel_sizes=_resolve_transformer_kernel_sizes(tr_cfg),
             stride=int(getattr(tr_cfg, "stride", 2)),
             num_heads=int(getattr(tr_cfg, "num_heads", 4)),
             depth=int(getattr(tr_cfg, "depth", 4)),

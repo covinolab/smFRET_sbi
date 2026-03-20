@@ -7,6 +7,7 @@ training:
   batch_size: 128
   validation_fraction: 0.1
   num_epochs: 50
+  seed: 42
   compile: false
   grad_clip: 0.0
   checkpoint_interval_minutes: 2
@@ -58,4 +59,3 @@ hydra:
     subdir: ${hydra.job.num}
   job:
     chdir: false  # Stay in original directory
-

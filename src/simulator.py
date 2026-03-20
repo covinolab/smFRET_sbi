@@ -17,6 +17,7 @@ def smFRET_simulator_wrapper(
                 max_G0=10.0,
                 boundary_condition='diffusive',
                 spline_type="cubic",
+                num_boundary_knots=4,
                 return_torch=False
     ):
             
@@ -27,7 +28,8 @@ def smFRET_simulator_wrapper(
             x_max=x_max,
             num_knots=num_knots,
             max_G0=max_G0,
-            boundary_condition=boundary_condition
+            boundary_condition=boundary_condition,  
+            num_boundary_knots=num_boundary_knots
         )
 
         kG_photons, kR_photons = smFRET_simulator(
@@ -86,6 +88,7 @@ def smFRET_simulator_wrapper_from_config(cfg: str):
     max_G0 = cfg.simulator.max_G0
     x_min = cfg.simulator.x_min
     x_max = cfg.simulator.x_max
+    num_boundary_knots = cfg.simulator.num_boundary_knots
     x_init = tuple(cfg.simulator.x_init)
 
     return partial(
@@ -100,5 +103,6 @@ def smFRET_simulator_wrapper_from_config(cfg: str):
         max_G0=max_G0,
         boundary_condition=boundary_condition,
         spline_type=spline_type,
+        num_boundary_knots=num_boundary_knots,
         return_torch=True
     )

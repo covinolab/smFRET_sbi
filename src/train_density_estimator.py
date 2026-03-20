@@ -1,20 +1,21 @@
+import logging
 import pickle
+import random
 import shutil
 import subprocess
+import time
 from copy import deepcopy
 from pathlib import Path
-import time
-import logging
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
+import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import torch
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 
-from sbi import utils as utils
 from sbi.neural_nets import posterior_nn
 
 from temporal_encoders import build_temporal_encoder
@@ -38,7 +39,7 @@ def _git_commit(repo_dir: Path) -> str:
 
 
 def save_checkpoint(path, epoch, model, optimizer, scheduler,
-                    best_val_loss, best_model_state_dict):
+                    best_val_loss, best_model_state_dict, best_epoch):
     """Save a resumable training checkpoint."""
     scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
     torch.save({
@@ -48,6 +49,7 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler,
         'scheduler_state_dict': scheduler_state_dict,
         'best_val_loss': best_val_loss,
         'best_model_state_dict': best_model_state_dict,
+        'best_epoch': best_epoch,
     }, path)
     log.info(f"Checkpoint saved: epoch {epoch}, best_val={best_val_loss:.4f}, path={path}")
 
@@ -65,7 +67,12 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
     elif scheduler is None and ckpt_scheduler_state is not None:
         log.info("Checkpoint contains scheduler state, but scheduler is disabled in config; ignoring scheduler state.")
     log.info(f"Resumed from checkpoint: epoch {ckpt['epoch']}, best_val={ckpt['best_val_loss']:.4f}, path={path}")
-    return ckpt['epoch'], ckpt['best_val_loss'], ckpt['best_model_state_dict']
+    return (
+        ckpt['epoch'],
+        ckpt['best_val_loss'],
+        ckpt['best_model_state_dict'],
+        ckpt.get('best_epoch', ckpt['epoch']),
+    )
 
 
 def setup_ddp():
@@ -97,15 +104,80 @@ def count_model_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def set_training_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _resolve_embedding_name(cfg_embedding: DictConfig) -> str:
+    name = getattr(cfg_embedding, "name", None)
+    if name is not None:
+        return str(name)
+    if hasattr(cfg_embedding, "kernel_sizes") or hasattr(cfg_embedding, "depth"):
+        return "transformer"
+    return "cnn"
+
+
+def _l2_norm(tensors) -> float:
+    norms = [tensor.detach().float().norm(2) for tensor in tensors if tensor is not None]
+    if not norms:
+        return 0.0
+    return torch.norm(torch.stack(norms), p=2).cpu().item()
+
+
+def _parameter_norm(parameters) -> float:
+    return _l2_norm([param for param in parameters if param.requires_grad])
+
+
+def _gradient_norm(parameters) -> float:
+    return _l2_norm([param.grad for param in parameters if param.requires_grad and param.grad is not None])
+
+
+def _split_trainable_parameters(model, encoder):
+    encoder_param_ids = {id(param) for param in encoder.parameters() if param.requires_grad}
+    encoder_params = []
+    flow_params = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in encoder_param_ids:
+            encoder_params.append(param)
+        else:
+            flow_params.append(param)
+    return encoder_params, flow_params
+
+
+def resolve_data_dir(data_dir, orig_cwd) -> Path:
+    data_dir = Path(data_dir)
+    if data_dir.is_absolute():
+        return data_dir
+
+    orig_candidate = Path(orig_cwd) / data_dir
+    if orig_candidate.exists():
+        return orig_candidate
+
+    repo_candidate = Path(__file__).resolve().parents[1] / data_dir
+    if repo_candidate.exists():
+        log.info(f"Resolved relative data_dir via repo root: {repo_candidate}")
+        return repo_candidate
+
+    return orig_candidate
+
+
 @hydra.main(version_base=None, config_path="../conf/training", config_name="density_estimator")
 def train(cfg: DictConfig) -> float:
     """Train the neural posterior estimator."""
     ddp = setup_ddp()
     device = get_device()
+    training_seed = int(getattr(cfg.training, "seed", 42))
+    set_training_seed(training_seed)
 
-    # Load data (use absolute path from original working directory)
+    # Resolve data paths relative to the launch directory first, then the repo root.
     orig_cwd = hydra.utils.get_original_cwd()
-    data_dir = Path(orig_cwd) / cfg.data.data_dir
+    data_dir = resolve_data_dir(cfg.data.data_dir, orig_cwd)
 
     # Load HDF5 data
     h5_files = sorted(data_dir.glob("*.h5"))
@@ -134,6 +206,7 @@ def train(cfg: DictConfig) -> float:
     num_examples = len(temp_dataset)
     theta_init, x_init = temp_dataset[:100]
     max_len = x_init.shape[1]
+    probe_x = x_init[: min(8, x_init.shape[0])].clone()
     del temp_dataset
 
     # Build embedding network (CNN / Transformer)
@@ -199,6 +272,8 @@ def train(cfg: DictConfig) -> float:
     prefetch_factor = cfg.data.prefetch_factor
 
     log.info(f"  Workers: {num_workers}, prefetch_factor: {prefetch_factor}")
+    train_loader_generator = torch.Generator().manual_seed(training_seed)
+    val_loader_generator = torch.Generator().manual_seed(training_seed + 1)
 
     train_loader = data.DataLoader(
         train_dataset,
@@ -207,6 +282,7 @@ def train(cfg: DictConfig) -> float:
         pin_memory=True,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
+        generator=train_loader_generator,
     )
     val_loader = data.DataLoader(
         val_dataset,
@@ -215,19 +291,22 @@ def train(cfg: DictConfig) -> float:
         pin_memory=True,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
+        generator=val_loader_generator,
     )
 
-    # Calculate steps per epoch for scheduler
-    # train_loader already yields full batches (H5Dataset batches internally)
-    steps_per_epoch = train_dataset.num_batches(num_workers=num_workers)
-    print(f"Calculated steps_per_epoch: {steps_per_epoch} vs expected: {len(train_dataset) // batch_size}")
+    # Calculate steps per epoch for scheduler from dataset batching logic
+    steps_per_epoch = train_dataset.num_batches(num_workers=max(1, num_workers))
     if steps_per_epoch <= 0:
         raise ValueError("train_loader has zero steps per epoch; cannot train or schedule LR")
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
-    
-    log.info(f"Total trainable parameters: {count_model_parameters(density_estimator):,}")
+
+    num_trainable_parameters = count_model_parameters(density_estimator)
+    encoder_params, flow_params = _split_trainable_parameters(density_estimator, encoder)
+
+    log.info(f"Training seed: {training_seed}")
+    log.info(f"Total trainable parameters: {num_trainable_parameters:,}")
 
     # Wrap in DDP: route loss() through forward() for gradient synchronization
     if ddp:
@@ -266,18 +345,14 @@ def train(cfg: DictConfig) -> float:
             pct_start=cfg.scheduler.pct_start,
             final_div_factor=cfg.scheduler.final_div_factor,
         )
-        scheduler_expected_total_steps = cfg.training.num_epochs * steps_per_epoch
-        scheduler_step_count = 0
         log.info("Scheduler enabled from config: OneCycleLR")
-        log.info(f"Scheduler target steps: {scheduler_expected_total_steps} ({cfg.training.num_epochs} epochs x {steps_per_epoch} steps/epoch)")
     else:
         scheduler = None
-        scheduler_expected_total_steps = None
-        scheduler_step_count = 0
         log.info(f"Scheduler not configured; using constant learning rate: {cfg.optimizer.lr}")
 
     best_val_loss = float("Inf")
     best_model_state_dict = None
+    best_epoch = 0
     start_epoch = 0
 
     # Get Hydra output directory
@@ -305,11 +380,9 @@ def train(cfg: DictConfig) -> float:
         if not resume_path.is_absolute():
             resume_path = Path(orig_cwd) / resume_path
         if resume_path.exists():
-            start_epoch, best_val_loss, best_model_state_dict = load_checkpoint(
+            start_epoch, best_val_loss, best_model_state_dict, best_epoch = load_checkpoint(
                 resume_path, density_estimator, optimizer, scheduler, device
             )
-            if scheduler is not None:
-                scheduler_step_count = max(0, scheduler.last_epoch + 1)
         else:
             log.warning(f"Checkpoint not found at {resume_path}, starting from scratch")
 
@@ -331,9 +404,10 @@ def train(cfg: DictConfig) -> float:
         density_estimator.train()
         train_loss_sum = 0
         train_samples = 0
-        local_train_steps = 0
+        train_steps = 0
+        clip_steps = 0
         for theta_batch, x_batch in train_loader:
-            local_train_steps += 1
+            train_steps += 1
             theta_batch = theta_batch.to(device, non_blocking=True)
             x_batch = x_batch.to(device, non_blocking=True)
             optimizer.zero_grad()
@@ -350,30 +424,25 @@ def train(cfg: DictConfig) -> float:
             train_loss.backward()
             grad_clip = cfg.training.grad_clip if "grad_clip" in cfg.training else None
             if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(density_estimator.parameters(), max_norm=grad_clip)
+                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                    density_estimator.parameters(),
+                    max_norm=grad_clip,
+                )
+                if torch.isfinite(grad_norm_before_clip) and grad_norm_before_clip.item() > grad_clip:
+                    clip_steps += 1
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
-                scheduler_step_count += 1
 
         # Aggregate training loss across DDP ranks
         if ddp:
             t = torch.tensor([train_loss_sum, float(train_samples)], device=device)
             dist.all_reduce(t)
+            train_samples_total = t[1].item()
             train_loss_avg = (t[0] / t[1]).item() if t[1] > 0 else 0
         else:
+            train_samples_total = float(train_samples)
             train_loss_avg = train_loss_sum / train_samples if train_samples > 0 else 0
-
-        # Check whether all DDP ranks performed same number of train steps
-        if ddp:
-            min_steps = torch.tensor(float(local_train_steps), device=device)
-            max_steps = torch.tensor(float(local_train_steps), device=device)
-            dist.all_reduce(min_steps, op=dist.ReduceOp.MIN)
-            dist.all_reduce(max_steps, op=dist.ReduceOp.MAX)
-            if is_main_process() and min_steps.item() != max_steps.item():
-                log.warning(
-                    f"DDP rank step mismatch detected in epoch {epoch}: min_steps={int(min_steps.item())}, max_steps={int(max_steps.item())}"
-                )
 
         # Validation
         density_estimator.eval()
@@ -395,39 +464,55 @@ def train(cfg: DictConfig) -> float:
         else:
             val_loss = val_loss_sum / val_samples if val_samples > 0 else 0
         epoch_time = time.time() - epoch_start
+        clip_fraction = clip_steps / train_steps if train_steps > 0 else 0.0
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state_dict = deepcopy(density_estimator.state_dict())
+            best_epoch = epoch
+
+            if is_main_process():
+                with open(hydra_output_dir / f"last_{cfg.artifacts.model_filename}", "wb") as f:
+                    pickle.dump(density_estimator, f)
 
         # Logging (rank 0 only)
         if is_main_process():
-            grad_norms = [p.grad.detach().norm(2) for p in density_estimator.parameters() if p.grad is not None]
-            total_norm = torch.norm(torch.stack(grad_norms)).cpu().item() if grad_norms else 0.0
+            total_norm = _gradient_norm(density_estimator.parameters())
+            encoder_grad_norm = _gradient_norm(encoder_params)
+            flow_grad_norm = _gradient_norm(flow_params)
+            encoder_param_norm = _parameter_norm(encoder_params)
+            flow_param_norm = _parameter_norm(flow_params)
+            throughput = train_samples_total / max(epoch_time, 1e-12)
+            with torch.no_grad():
+                probe_embeddings = encoder(probe_x.to(device, non_blocking=True)).detach().float()
+                if probe_embeddings.ndim == 1:
+                    probe_embeddings = probe_embeddings.unsqueeze(-1)
+                probe_mean = probe_embeddings.mean().item()
+                probe_std = probe_embeddings.std(unbiased=False).item()
+                probe_l2 = probe_embeddings.norm(dim=-1).mean().item()
+
             writer.add_scalar("Norm/Grad_Norm", total_norm, epoch)
+            writer.add_scalar("Norm/Grad_Norm_Encoder", encoder_grad_norm, epoch)
+            writer.add_scalar("Norm/Grad_Norm_Flow", flow_grad_norm, epoch)
+            writer.add_scalar("Norm/Param_Norm_Encoder", encoder_param_norm, epoch)
+            writer.add_scalar("Norm/Param_Norm_Flow", flow_param_norm, epoch)
             writer.add_scalar("Loss/train", train_loss_avg, epoch)
             writer.add_scalar("Loss/val", val_loss, epoch)
             writer.add_scalar("Loss/gap", train_loss_avg - val_loss, epoch)
             writer.add_scalar("Learning_rate", optimizer.param_groups[0]["lr"], epoch)
             writer.add_scalar("Epoch_time_seconds", epoch_time, epoch)
+            writer.add_scalar("Optimization/clip_fraction", clip_fraction, epoch)
+            writer.add_scalar("Embedding/probe_mean", probe_mean, epoch)
+            writer.add_scalar("Embedding/probe_std", probe_std, epoch)
+            writer.add_scalar("Embedding/probe_l2", probe_l2, epoch)
+            writer.add_scalar("Throughput/samples_per_sec", throughput, epoch)
 
             # Estimate remaining training time
             elapsed_time = time.time() - epoch_start
             remaining_epochs = cfg.training.num_epochs - epoch
             estimated_remaining_time = elapsed_time * remaining_epochs
-            if scheduler is not None:
-                log.info(
-                    f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, "
-                    f"LRstep={scheduler_step_count}/{scheduler_expected_total_steps}, "
-                    f"lr={optimizer.param_groups[0]['lr']:.3e}, ETA: {estimated_remaining_time/60:.1f}min"
-                )
-            else:
-                log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
+            log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
             writer.flush()
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state_dict = deepcopy(density_estimator.state_dict())
-
-            if is_main_process():
-                with open(hydra_output_dir / f"last_{cfg.artifacts.model_filename}", "wb") as f:
-                    pickle.dump(density_estimator, f)
 
         # Time-based checkpoint (rank 0 only)
         if is_main_process() and ckpt_interval_min > 0:
@@ -435,18 +520,12 @@ def train(cfg: DictConfig) -> float:
                 save_checkpoint(
                     hydra_output_dir / cfg.artifacts.checkpoint_filename,
                     epoch, density_estimator, optimizer, scheduler,
-                    best_val_loss, best_model_state_dict,
+                    best_val_loss, best_model_state_dict, best_epoch,
                 )
                 last_ckpt_time = time.time()
 
     # Save and log only on rank 0
     if is_main_process():
-        if scheduler is not None and scheduler_expected_total_steps is not None and scheduler_step_count != scheduler_expected_total_steps:
-            log.warning(
-                f"Scheduler finished with unexpected step count: actual={scheduler_step_count}, "
-                f"expected={scheduler_expected_total_steps}"
-            )
-
         # Log hyperparameters
         hparams = {
             "optimizer_lr": cfg.optimizer.lr,
@@ -454,8 +533,12 @@ def train(cfg: DictConfig) -> float:
             "max_lr": cfg.scheduler.max_lr if scheduler_cfg is not None else cfg.optimizer.lr,
             "batch_size": cfg.training.batch_size,
             "num_epochs": cfg.training.num_epochs,
-            "embedding_name": str(cfg.embedding.name if "name" in cfg.embedding else "cnn"),
+            "training_seed": training_seed,
+            "embedding_name": _resolve_embedding_name(cfg.embedding),
             "embedding_cfg": OmegaConf.to_yaml(cfg.embedding),
+            "data_chunk_step": cfg.data.chunk_step,
+            "shuffle_buffer_samples": chunk_size * chunk_step,
+            "num_parameters": num_trainable_parameters,
             "hidden_features": cfg.flow.hidden_features,
             "model": cfg.flow.model,
             "num_transforms": cfg.flow.num_transforms,

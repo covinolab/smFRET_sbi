@@ -1,170 +1,45 @@
 import logging
 import pickle
-import random
 import shutil
-import subprocess
 import time
 from copy import deepcopy
 from pathlib import Path
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
-import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 
 from sbi.neural_nets import posterior_nn
 
-from temporal_encoders import build_temporal_encoder
 from data_loaders import H5Dataset
-
 import os
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+from temporal_encoders import build_temporal_encoder
+from utils import (
+    assert_equal_train_steps as _assert_equal_train_steps,
+    cleanup_ddp,
+    count_model_parameters,
+    get_device,
+    git_commit as _git_commit,
+    gradient_norm as _gradient_norm,
+    is_main_process,
+    load_checkpoint,
+    parameter_norm as _parameter_norm,
+    resolve_data_dir,
+    resolve_embedding_name as _resolve_embedding_name,
+    save_checkpoint,
+    set_training_seed,
+    setup_ddp,
+    split_trainable_parameters as _split_trainable_parameters,
+    trim_ddp_train_chunks as _trim_ddp_train_chunks,
+)
 
 log = logging.getLogger(__name__)
-
-
-def _git_commit(repo_dir: Path) -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL, text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
-
-
-def save_checkpoint(path, epoch, model, optimizer, scheduler,
-                    best_val_loss, best_model_state_dict, best_epoch):
-    """Save a resumable training checkpoint."""
-    scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler_state_dict,
-        'best_val_loss': best_val_loss,
-        'best_model_state_dict': best_model_state_dict,
-        'best_epoch': best_epoch,
-    }, path)
-    log.info(f"Checkpoint saved: epoch {epoch}, best_val={best_val_loss:.4f}, path={path}")
-
-
-def load_checkpoint(path, model, optimizer, scheduler, device):
-    """Load checkpoint and return (start_epoch, best_val_loss, best_model_state_dict)."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
-    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    ckpt_scheduler_state = ckpt.get('scheduler_state_dict', None)
-    if scheduler is not None and ckpt_scheduler_state is not None:
-        scheduler.load_state_dict(ckpt_scheduler_state)
-    elif scheduler is not None and ckpt_scheduler_state is None:
-        log.warning("Checkpoint has no scheduler state, but scheduler is enabled in config.")
-    elif scheduler is None and ckpt_scheduler_state is not None:
-        log.info("Checkpoint contains scheduler state, but scheduler is disabled in config; ignoring scheduler state.")
-    log.info(f"Resumed from checkpoint: epoch {ckpt['epoch']}, best_val={ckpt['best_val_loss']:.4f}, path={path}")
-    return (
-        ckpt['epoch'],
-        ckpt['best_val_loss'],
-        ckpt['best_model_state_dict'],
-        ckpt.get('best_epoch', ckpt['epoch']),
-    )
-
-
-def setup_ddp():
-    """Initialize DDP if launched via torchrun. Returns True if DDP is active."""
-    if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        return True
-    return False
-
-
-def cleanup_ddp():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def is_main_process():
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-
-def get_device():
-    if dist.is_initialized():
-        return torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    if torch.cuda.is_available():
-        return torch.device("cuda:0")
-    return torch.device("cpu")
-
-def count_model_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def set_training_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _resolve_embedding_name(cfg_embedding: DictConfig) -> str:
-    name = getattr(cfg_embedding, "name", None)
-    if name is not None:
-        return str(name)
-    if hasattr(cfg_embedding, "kernel_sizes") or hasattr(cfg_embedding, "depth"):
-        return "transformer"
-    return "cnn"
-
-
-def _l2_norm(tensors) -> float:
-    norms = [tensor.detach().float().norm(2) for tensor in tensors if tensor is not None]
-    if not norms:
-        return 0.0
-    return torch.norm(torch.stack(norms), p=2).cpu().item()
-
-
-def _parameter_norm(parameters) -> float:
-    return _l2_norm([param for param in parameters if param.requires_grad])
-
-
-def _gradient_norm(parameters) -> float:
-    return _l2_norm([param.grad for param in parameters if param.requires_grad and param.grad is not None])
-
-
-def _split_trainable_parameters(model, encoder):
-    encoder_param_ids = {id(param) for param in encoder.parameters() if param.requires_grad}
-    encoder_params = []
-    flow_params = []
-    for param in model.parameters():
-        if not param.requires_grad:
-            continue
-        if id(param) in encoder_param_ids:
-            encoder_params.append(param)
-        else:
-            flow_params.append(param)
-    return encoder_params, flow_params
-
-
-def resolve_data_dir(data_dir, orig_cwd) -> Path:
-    data_dir = Path(data_dir)
-    if data_dir.is_absolute():
-        return data_dir
-
-    orig_candidate = Path(orig_cwd) / data_dir
-    if orig_candidate.exists():
-        return orig_candidate
-
-    repo_candidate = Path(__file__).resolve().parents[1] / data_dir
-    if repo_candidate.exists():
-        log.info(f"Resolved relative data_dir via repo root: {repo_candidate}")
-        return repo_candidate
-
-    return orig_candidate
 
 
 @hydra.main(version_base=None, config_path="../conf/training", config_name="density_estimator")
@@ -177,7 +52,7 @@ def train(cfg: DictConfig) -> float:
 
     # Resolve data paths relative to the launch directory first, then the repo root.
     orig_cwd = hydra.utils.get_original_cwd()
-    data_dir = resolve_data_dir(cfg.data.data_dir, orig_cwd)
+    data_dir = resolve_data_dir(cfg.data.data_dir, orig_cwd, logger=log)
 
     # Load HDF5 data
     h5_files = sorted(data_dir.glob("*.h5"))
@@ -243,6 +118,22 @@ def train(cfg: DictConfig) -> float:
     # Partition chunks across DDP ranks
     if ddp:
         rank, world_size = dist.get_rank(), dist.get_world_size()
+        (
+            train_chunk_indices,
+            dropped_partial_train_chunks,
+            dropped_remainder_train_chunks,
+        ) = _trim_ddp_train_chunks(
+            train_chunk_indices,
+            chunk_size=chunk_size,
+            num_examples=num_examples,
+            world_size=world_size,
+        )
+        if is_main_process() and (dropped_partial_train_chunks or dropped_remainder_train_chunks):
+            log.info(
+                "Trimmed train chunks for even DDP sharding: dropped %d partial chunk(s) and %d extra full chunk(s).",
+                dropped_partial_train_chunks,
+                dropped_remainder_train_chunks,
+            )
         train_chunk_indices = train_chunk_indices[rank::world_size]
         val_chunk_indices = val_chunk_indices[rank::world_size]
 
@@ -298,6 +189,10 @@ def train(cfg: DictConfig) -> float:
     steps_per_epoch = train_dataset.num_batches(num_workers=max(1, num_workers))
     if steps_per_epoch <= 0:
         raise ValueError("train_loader has zero steps per epoch; cannot train or schedule LR")
+    if ddp:
+        ddp_steps = _assert_equal_train_steps(steps_per_epoch, device)
+        if is_main_process():
+            log.info(f"  DDP train steps per rank: {ddp_steps}")
 
     density_estimator = neural_posterior(theta_init, x_init)
     density_estimator.to(device)
@@ -381,7 +276,7 @@ def train(cfg: DictConfig) -> float:
             resume_path = Path(orig_cwd) / resume_path
         if resume_path.exists():
             start_epoch, best_val_loss, best_model_state_dict, best_epoch = load_checkpoint(
-                resume_path, density_estimator, optimizer, scheduler, device
+                resume_path, density_estimator, optimizer, scheduler, device, logger=log
             )
         else:
             log.warning(f"Checkpoint not found at {resume_path}, starting from scratch")
@@ -521,6 +416,7 @@ def train(cfg: DictConfig) -> float:
                     hydra_output_dir / cfg.artifacts.checkpoint_filename,
                     epoch, density_estimator, optimizer, scheduler,
                     best_val_loss, best_model_state_dict, best_epoch,
+                    logger=log,
                 )
                 last_ckpt_time = time.time()
 

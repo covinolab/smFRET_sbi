@@ -1,9 +1,11 @@
+import sbi
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
 import math
 from einops.layers.torch import Rearrange
+from sbi.neural_nets.embedding_nets import LRUEmbedding
 
 class Downsample1d(nn.Module):
     def __init__(self, dim):
@@ -339,6 +341,24 @@ def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
             max_len=max_len,
             output_dim=int(getattr(tr_cfg, "output_dim", 128)),
         )
+    
+    if encoder_name in {"LRU", "lru"}:
+        return LRUEmbedding(
+            input_dim=transition_dim,
+            output_dim=int(getattr(cfg_embedding, "output_dim", 128)),
+            state_dim=int(getattr(cfg_embedding, "state_dim", 20)),
+            hidden_dim=int(getattr(cfg_embedding, "hidden_dim", 40)),
+            num_blocks=int(getattr(cfg_embedding, "num_blocks", 2)),
+            r_min=float(getattr(cfg_embedding, "r_min", 0.0)),
+            r_max=float(getattr(cfg_embedding, "r_max", 1.0)),
+            phase_max=float(getattr(cfg_embedding, "phase_max", 2 * 3.141592653589793)),
+            bidirectional=True,
+            mode="loop",
+            dropout=float(getattr(cfg_embedding, "dropout", 0.0)),
+            apply_input_normalization=False,
+            aggregate_fcn="mean"
+        )
+    
 
     raise ValueError(
         f"Unknown embedding.name='{encoder_name}'. Use one of: cnn, transformer."

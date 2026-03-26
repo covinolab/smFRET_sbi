@@ -119,6 +119,83 @@ class _LossForward(torch.nn.Module):
         return classifier_losses(self.wrapped, theta, x, self.num_atoms)
 
 
+def _train_one_epoch(
+    loss_forward,
+    ratio_estimator,
+    train_loader,
+    optimizer,
+    scheduler,
+    device,
+    grad_clip,
+    ddp,
+):
+    ratio_estimator.train()
+    train_loss_sum = 0
+    train_samples = 0
+    train_steps = 0
+    clip_steps = 0
+    for theta_batch, x_batch in train_loader:
+        train_steps += 1
+        theta_batch = theta_batch.to(device, non_blocking=True)
+        x_batch = x_batch.to(device, non_blocking=True)
+        optimizer.zero_grad()
+        train_losses = loss_forward(theta_batch, x_batch)
+        train_loss = train_losses.mean()
+        train_loss_sum += train_losses.sum().item()
+        train_samples += theta_batch.size(0)
+        train_loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                ratio_estimator.parameters(),
+                max_norm=grad_clip,
+            )
+            if torch.isfinite(grad_norm_before_clip) and grad_norm_before_clip.item() > grad_clip:
+                clip_steps += 1
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+    if ddp:
+        t = torch.tensor([train_loss_sum, float(train_samples)], device=device)
+        dist.all_reduce(t)
+        train_samples_total = t[1].item()
+        train_loss_avg = (t[0] / t[1]).item() if t[1] > 0 else 0
+    else:
+        train_samples_total = float(train_samples)
+        train_loss_avg = train_loss_sum / train_samples if train_samples > 0 else 0
+
+    clip_fraction = clip_steps / train_steps if train_steps > 0 else 0.0
+    return train_loss_avg, train_samples_total, clip_fraction
+
+
+def _validate_one_epoch(ratio_estimator, val_loader, num_atoms, device, ddp):
+    ratio_estimator.eval()
+    val_loss_sum = 0
+    val_samples = 0
+    skipped_val_batches = 0
+    with torch.no_grad():
+        for theta_batch, x_batch in val_loader:
+            if theta_batch.size(0) < num_atoms:
+                skipped_val_batches += 1
+                continue
+            theta_batch = theta_batch.to(device, non_blocking=True)
+            x_batch = x_batch.to(device, non_blocking=True)
+            val_losses = classifier_losses(ratio_estimator, theta_batch, x_batch, num_atoms)
+            val_loss_sum += val_losses.sum().item()
+            val_samples += theta_batch.size(0)
+
+    if ddp:
+        t = torch.tensor([val_loss_sum, float(val_samples), float(skipped_val_batches)], device=device)
+        dist.all_reduce(t)
+        val_loss = (t[0] / t[1]).item() if t[1] > 0 else 0
+        skipped_val_batches_total = int(t[2].item())
+    else:
+        val_loss = val_loss_sum / val_samples if val_samples > 0 else 0
+        skipped_val_batches_total = skipped_val_batches
+
+    return val_loss, skipped_val_batches_total
+
+
 @hydra.main(version_base=None, config_path="../conf/training", config_name="ratio_estimator")
 def train(cfg: DictConfig) -> float:
     """Train the neural ratio estimator."""
@@ -334,6 +411,7 @@ def train(cfg: DictConfig) -> float:
 
     ckpt_interval_min = cfg.training.checkpoint_interval_minutes if "checkpoint_interval_minutes" in cfg.training else 0
     last_ckpt_time = time.time()
+    grad_clip = cfg.training.grad_clip if "grad_clip" in cfg.training else None
 
     if is_main_process():
         writer = SummaryWriter(log_dir=hydra_output_dir / "tensorboard", flush_secs=30)
@@ -344,68 +422,15 @@ def train(cfg: DictConfig) -> float:
     for epoch in range(start_epoch + 1, cfg.training.num_epochs + 1):
         epoch_start = time.time()
 
-        ratio_estimator.train()
-        train_loss_sum = 0
-        train_samples = 0
-        train_steps = 0
-        clip_steps = 0
-        for theta_batch, x_batch in train_loader:
-            train_steps += 1
-            theta_batch = theta_batch.to(device, non_blocking=True)
-            x_batch = x_batch.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            train_losses = loss_forward(theta_batch, x_batch)
-            train_loss = train_losses.mean()
-            train_loss_sum += train_losses.sum().item()
-            train_samples += theta_batch.size(0)
-            train_loss.backward()
-            grad_clip = cfg.training.grad_clip if "grad_clip" in cfg.training else None
-            if grad_clip is not None and grad_clip > 0:
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
-                    ratio_estimator.parameters(),
-                    max_norm=grad_clip,
-                )
-                if torch.isfinite(grad_norm_before_clip) and grad_norm_before_clip.item() > grad_clip:
-                    clip_steps += 1
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
-
-        if ddp:
-            t = torch.tensor([train_loss_sum, float(train_samples)], device=device)
-            dist.all_reduce(t)
-            train_samples_total = t[1].item()
-            train_loss_avg = (t[0] / t[1]).item() if t[1] > 0 else 0
-        else:
-            train_samples_total = float(train_samples)
-            train_loss_avg = train_loss_sum / train_samples if train_samples > 0 else 0
-
-        ratio_estimator.eval()
-        val_loss_sum = 0
-        val_samples = 0
-        skipped_val_batches = 0
-        with torch.no_grad():
-            for theta_batch, x_batch in val_loader:
-                if theta_batch.size(0) < num_atoms:
-                    skipped_val_batches += 1
-                    continue
-                theta_batch = theta_batch.to(device, non_blocking=True)
-                x_batch = x_batch.to(device, non_blocking=True)
-                val_losses = classifier_losses(ratio_estimator, theta_batch, x_batch, num_atoms)
-                val_loss_sum += val_losses.sum().item()
-                val_samples += theta_batch.size(0)
-
-        if ddp:
-            t = torch.tensor([val_loss_sum, float(val_samples), float(skipped_val_batches)], device=device)
-            dist.all_reduce(t)
-            val_loss = (t[0] / t[1]).item() if t[1] > 0 else 0
-            skipped_val_batches_total = int(t[2].item())
-        else:
-            val_loss = val_loss_sum / val_samples if val_samples > 0 else 0
-            skipped_val_batches_total = skipped_val_batches
+        train_loss_avg, train_samples_total, clip_fraction = _train_one_epoch(
+            loss_forward, ratio_estimator, train_loader, optimizer, scheduler,
+            device, grad_clip, ddp,
+        )
+        val_loss, skipped_val_batches_total = _validate_one_epoch(
+            ratio_estimator, val_loader, num_atoms, device, ddp,
+        )
 
         epoch_time = time.time() - epoch_start
-        clip_fraction = clip_steps / train_steps if train_steps > 0 else 0.0
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -450,9 +475,8 @@ def train(cfg: DictConfig) -> float:
             if skipped_val_batches_total > 0:
                 writer.add_scalar("Validation/skipped_small_batches", skipped_val_batches_total, epoch)
 
-            elapsed_time = time.time() - epoch_start
             remaining_epochs = cfg.training.num_epochs - epoch
-            estimated_remaining_time = elapsed_time * remaining_epochs
+            estimated_remaining_time = epoch_time * remaining_epochs
             log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
             if skipped_val_batches_total > 0:
                 log.warning(

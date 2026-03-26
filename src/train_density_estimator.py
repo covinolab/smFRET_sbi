@@ -42,6 +42,86 @@ from utils import (
 log = logging.getLogger(__name__)
 
 
+class _LossForward(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.wrapped = model
+
+    def forward(self, theta, x):
+        return self.wrapped.loss(theta, x)
+
+
+def _train_one_epoch(
+    loss_forward,
+    density_estimator,
+    train_loader,
+    optimizer,
+    scheduler,
+    device,
+    grad_clip,
+    ddp,
+):
+    density_estimator.train()
+    train_loss_sum = 0
+    train_samples = 0
+    train_steps = 0
+    clip_steps = 0
+    for theta_batch, x_batch in train_loader:
+        train_steps += 1
+        theta_batch = theta_batch.to(device, non_blocking=True)
+        x_batch = x_batch.to(device, non_blocking=True)
+        optimizer.zero_grad()
+        train_losses = loss_forward(theta_batch, x_batch)
+        train_loss = train_losses.mean()
+        train_loss_sum += train_losses.sum().item()
+        train_samples += theta_batch.size(0)
+        train_loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                density_estimator.parameters(),
+                max_norm=grad_clip,
+            )
+            if torch.isfinite(grad_norm_before_clip) and grad_norm_before_clip.item() > grad_clip:
+                clip_steps += 1
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+    if ddp:
+        t = torch.tensor([train_loss_sum, float(train_samples)], device=device)
+        dist.all_reduce(t)
+        train_samples_total = t[1].item()
+        train_loss_avg = (t[0] / t[1]).item() if t[1] > 0 else 0
+    else:
+        train_samples_total = float(train_samples)
+        train_loss_avg = train_loss_sum / train_samples if train_samples > 0 else 0
+
+    clip_fraction = clip_steps / train_steps if train_steps > 0 else 0.0
+    return train_loss_avg, train_samples_total, clip_fraction
+
+
+def _validate_one_epoch(density_estimator, val_loader, device, ddp):
+    density_estimator.eval()
+    val_loss_sum = 0
+    val_samples = 0
+    with torch.no_grad():
+        for theta_batch, x_batch in val_loader:
+            val_losses = density_estimator.loss(
+                theta_batch.to(device), x_batch.to(device)
+            )
+            val_loss_sum += val_losses.sum().item()
+            val_samples += theta_batch.size(0)
+
+    if ddp:
+        t = torch.tensor([val_loss_sum, float(val_samples)], device=device)
+        dist.all_reduce(t)
+        val_loss = (t[0] / t[1]).item() if t[1] > 0 else 0
+    else:
+        val_loss = val_loss_sum / val_samples if val_samples > 0 else 0
+
+    return val_loss
+
+
 @hydra.main(version_base=None, config_path="../conf/training", config_name="density_estimator")
 def train(cfg: DictConfig) -> float:
     """Train the neural posterior estimator."""
@@ -203,26 +283,12 @@ def train(cfg: DictConfig) -> float:
     log.info(f"Training seed: {training_seed}")
     log.info(f"Total trainable parameters: {num_trainable_parameters:,}")
 
-    # Wrap in DDP: route loss() through forward() for gradient synchronization
+    loss_forward = _LossForward(density_estimator)
     if ddp:
-        class _LossForward(torch.nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.wrapped = model
-            def forward(self, theta, x):
-                return self.wrapped.loss(theta, x)
-
         local_rank = int(os.environ["LOCAL_RANK"])
-        ddp_loss = DDP(_LossForward(density_estimator), device_ids=[local_rank])
-    else:
-        ddp_loss = None
-
-    # compile model (for faster training)
+        loss_forward = DDP(loss_forward, device_ids=[local_rank])
     if cfg.training.compile:
-        if ddp_loss is not None:
-            ddp_loss = torch.compile(ddp_loss)
-        else:
-            density_estimator = torch.compile(density_estimator)
+        loss_forward = torch.compile(loss_forward)
 
     optimizer = torch.optim.AdamW(
         density_estimator.parameters(),
@@ -284,6 +350,7 @@ def train(cfg: DictConfig) -> float:
     # Time-based checkpointing
     ckpt_interval_min = cfg.training.checkpoint_interval_minutes if "checkpoint_interval_minutes" in cfg.training else 0
     last_ckpt_time = time.time()
+    grad_clip = cfg.training.grad_clip if "grad_clip" in cfg.training else None
 
     # TensorBoard logging (in Hydra output directory) — only on rank 0
     if is_main_process():
@@ -294,72 +361,14 @@ def train(cfg: DictConfig) -> float:
 
     for epoch in range(start_epoch + 1, cfg.training.num_epochs + 1):
         epoch_start = time.time()
-        
-        # Training
-        density_estimator.train()
-        train_loss_sum = 0
-        train_samples = 0
-        train_steps = 0
-        clip_steps = 0
-        for theta_batch, x_batch in train_loader:
-            train_steps += 1
-            theta_batch = theta_batch.to(device, non_blocking=True)
-            x_batch = x_batch.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            if ddp_loss is not None:
-                train_losses = ddp_loss(theta_batch, x_batch)
-            else:
-                train_losses = density_estimator.loss(
-                    theta_batch, x_batch
-                )
 
-            train_loss = train_losses.mean()
-            train_loss_sum += train_losses.sum().item()
-            train_samples += theta_batch.size(0)
-            train_loss.backward()
-            grad_clip = cfg.training.grad_clip if "grad_clip" in cfg.training else None
-            if grad_clip is not None and grad_clip > 0:
-                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
-                    density_estimator.parameters(),
-                    max_norm=grad_clip,
-                )
-                if torch.isfinite(grad_norm_before_clip) and grad_norm_before_clip.item() > grad_clip:
-                    clip_steps += 1
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+        train_loss_avg, train_samples_total, clip_fraction = _train_one_epoch(
+            loss_forward, density_estimator, train_loader, optimizer, scheduler,
+            device, grad_clip, ddp,
+        )
+        val_loss = _validate_one_epoch(density_estimator, val_loader, device, ddp)
 
-        # Aggregate training loss across DDP ranks
-        if ddp:
-            t = torch.tensor([train_loss_sum, float(train_samples)], device=device)
-            dist.all_reduce(t)
-            train_samples_total = t[1].item()
-            train_loss_avg = (t[0] / t[1]).item() if t[1] > 0 else 0
-        else:
-            train_samples_total = float(train_samples)
-            train_loss_avg = train_loss_sum / train_samples if train_samples > 0 else 0
-
-        # Validation
-        density_estimator.eval()
-        val_loss_sum = 0
-        val_samples = 0
-        with torch.no_grad():
-            for theta_batch, x_batch in val_loader:
-                val_losses = density_estimator.loss(
-                    theta_batch.to(device), x_batch.to(device)
-                )
-                val_loss_sum += val_losses.sum().item()
-                val_samples += theta_batch.size(0)
-
-        # Aggregate validation loss across DDP ranks
-        if ddp:
-            t = torch.tensor([val_loss_sum, float(val_samples)], device=device)
-            dist.all_reduce(t)
-            val_loss = (t[0] / t[1]).item() if t[1] > 0 else 0
-        else:
-            val_loss = val_loss_sum / val_samples if val_samples > 0 else 0
         epoch_time = time.time() - epoch_start
-        clip_fraction = clip_steps / train_steps if train_steps > 0 else 0.0
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -402,10 +411,8 @@ def train(cfg: DictConfig) -> float:
             writer.add_scalar("Embedding/probe_l2", probe_l2, epoch)
             writer.add_scalar("Throughput/samples_per_sec", throughput, epoch)
 
-            # Estimate remaining training time
-            elapsed_time = time.time() - epoch_start
             remaining_epochs = cfg.training.num_epochs - epoch
-            estimated_remaining_time = elapsed_time * remaining_epochs
+            estimated_remaining_time = epoch_time * remaining_epochs
             log.info(f"Epoch {epoch}: train={train_loss_avg:.4f}, val={val_loss:.4f}, ETA: {estimated_remaining_time/60:.1f}min")
             writer.flush()
 

@@ -21,7 +21,7 @@ prior:
   C_gr_lims: [0.0, 0.2]        # Prob green photon -> red detector
   C_rg_lims: [0.0, 0.2]        # Prob red photon -> green detector
 
-  num_knots: 6                # number of spline knots for potential
+  num_knots: 5                # number of spline knots for potential
   center: null           # mean values for spline coefficients (default: zero)
   scale: 7.0
 
@@ -41,7 +41,7 @@ simulator:
 
 
 data_generation:
-  num_simulations: 1280       # number of simulations to generate
+  num_simulations: 6400      # number of simulations to generate
   batch_size: 16              # simulations per batch
   chunk_size: 128              # HDF5 chunk size (samples per chunk)
 

@@ -243,12 +243,13 @@ def train(cfg: DictConfig) -> float:
     )
 
     neural_ratio = classifier_nn(
-        model=cfg.classifier.model,
+        model="resnet",
         z_score_theta="independent",
         z_score_x="none",
         hidden_features=cfg.classifier.hidden_features,
         embedding_net_theta=nn.Identity(),
         embedding_net_x=encoder,
+        **{'dropout_probability': cfg.classifier.dropout_probability, 'num_blocks': cfg.classifier.num_blocks, 'use_batch_norm': cfg.classifier.use_batch_norm},
     )
 
     num_chunks = (num_examples + chunk_size - 1) // chunk_size
@@ -515,9 +516,11 @@ def train(cfg: DictConfig) -> float:
             "shuffle_buffer_samples": chunk_size * chunk_step,
             "num_parameters": num_trainable_parameters,
             "hidden_features": cfg.classifier.hidden_features,
-            "model": cfg.classifier.model,
             "num_atoms": cfg.classifier.num_atoms,
             "best_epoch": best_epoch,
+            "dropout_probability": cfg.classifier.dropout_probability,
+            "num_blocks": cfg.classifier.num_blocks,
+            "use_batch_norm": cfg.classifier.use_batch_norm,
         }
         writer.add_hparams(
             hparam_dict=hparams,

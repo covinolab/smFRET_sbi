@@ -18,7 +18,7 @@ optimizer:
   weight_decay: 0.01
 
 scheduler:
-  max_lr: 1e-3
+  max_lr: 5e-4
   pct_start: 0.3
   final_div_factor: 1e4
 
@@ -40,9 +40,11 @@ flow:
   use_batch_norm: false
 
 classifier:
-  model: "resnet"
   hidden_features: 128
-  num_atoms: 10
+  num_atoms: 100
+  dropout_probability: 0.2
+  num_blocks : 2
+  use_batch_norm: false
 
 # Data settings
 data:

@@ -205,6 +205,40 @@ def _determine_output_shape(sim_kwargs, prior, max_attempts=100):
     )
 
 
+def _prepare_output_dir(output_dir_arg, cfg_output_dir, use_timestamp):
+    """Create and return the output directory path."""
+    output_dir = Path(output_dir_arg or cfg_output_dir)
+    if use_timestamp:
+        output_dir = output_dir / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _run_simulation_pool(batches, num_workers, out_queue, sim_kwargs, theta_dim, num_simulations):
+    """Run the worker pool and return the total number of successful simulations."""
+    pool = mp.Pool(
+        num_workers,
+        initializer=_init_worker,
+        initargs=(out_queue, sim_kwargs, theta_dim),
+    )
+    total_simulated = 0
+    for count in pool.imap_unordered(_worker_simulate_batch, batches):
+        total_simulated += count
+        print(f"\r  Progress: {total_simulated}/{num_simulations} simulated", end="", flush=True)
+    pool.close()
+    pool.join()
+    print()
+    return total_simulated
+
+
+def _export_pt(h5_path, output_dir):
+    """Export theta and x datasets from an HDF5 file as PyTorch tensors."""
+    with h5py.File(h5_path, "r") as f:
+        torch.save(torch.from_numpy(f["theta"][:]), output_dir / "theta.pt")
+        torch.save(torch.from_numpy(f["x"][:]), output_dir / "x.pt")
+    print("  Saved theta.pt and x.pt")
+
+
 # ─── Main generation routine ────────────────────────────────────────────────
 def generate_simulations(cfg, args):
     """
@@ -222,7 +256,7 @@ def generate_simulations(cfg, args):
     num_workers = args.num_workers or cfg.data_generation.num_workers
     batch_size = cfg.data_generation.batch_size
     chunk_size = args.chunk_size or cfg.data_generation.chunk_size
-    theta_dim = cfg.prior.num_knots + 1
+    theta_dim = cfg.prior.num_knots
 
     prior = generate_fret_prior_from_config(cfg, device="cpu")
     sim_kwargs = _get_sim_kwargs(cfg)
@@ -233,67 +267,38 @@ def generate_simulations(cfg, args):
     print(f"  theta dim: {theta_dim}, observation shape: {x_shape}")
 
     # ── Prepare output directory ──
-    output_dir = Path(args.output_dir or cfg.output.directory)
-    if args.timestamp:
-        output_dir = output_dir / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    output_dir = _prepare_output_dir(args.output_dir, cfg.output.directory, args.timestamp)
     h5_path = str(output_dir / "data.h5")
 
     # ── Sample parameters from the prior ──
     print(f"Sampling {num_simulations} parameter sets from prior...")
     all_theta = prior.sample((num_simulations,))
-
-    num_batches = (num_simulations + batch_size - 1) // batch_size
     batches = [
         all_theta[i * batch_size : min((i + 1) * batch_size, num_simulations)]
-        for i in range(num_batches)
+        for i in range((num_simulations + batch_size - 1) // batch_size)
     ]
+
+    batch_x_mb = int(np.prod(x_shape)) * 4 * batch_size / (1024 ** 2)
+    print(
+        f"Starting {num_simulations} simulations with {num_workers} workers "
+        f"(batch_size={batch_size}, {len(batches)} batches)..."
+    )
+    print(f"  x_shape={x_shape}, per-batch result size ~{batch_x_mb:.1f} MB", flush=True)
 
     # ── Start the dedicated writer process ──
     # No maxsize — workers never block on put(), avoiding deadlock.
     # Memory is bounded: at most num_batches items in flight (~few hundred MB).
     out_queue = mp.Queue()
     done_queue = mp.Queue(maxsize=1)
-
     writer = mp.Process(
         target=_writer_process,
-        args=(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
-              out_queue, done_queue),
+        args=(h5_path, num_simulations, theta_dim, x_shape, chunk_size, out_queue, done_queue),
         daemon=False,
     )
     writer.start()
 
     # ── Run simulations ──
-    print(
-        f"Starting {num_simulations} simulations with {num_workers} workers "
-        f"(batch_size={batch_size}, {num_batches} batches)..."
-    )
-    # Print expected data sizes
-    single_x_bytes = 4  # float32
-    for d in x_shape:
-        single_x_bytes *= d
-    batch_x_mb = (single_x_bytes * batch_size) / (1024 * 1024)
-    print(f"  x_shape={x_shape}, per-batch result size ~{batch_x_mb:.1f} MB", flush=True)
-
-    total_simulated = 0
-    pool = mp.Pool(
-        num_workers,
-        initializer=_init_worker,
-        initargs=(out_queue, sim_kwargs, theta_dim),
-    )
-    for count in pool.imap_unordered(_worker_simulate_batch, batches):
-        total_simulated += count
-        print(
-            f"\r  Progress: {total_simulated}/{num_simulations} simulated",
-            end="",
-            flush=True,
-        )
-
-    pool.close()
-    pool.join()
-
-    print()
+    _run_simulation_pool(batches, num_workers, out_queue, sim_kwargs, theta_dim, num_simulations)
 
     # Signal writer to finish, then wait
     out_queue.put(None)
@@ -311,10 +316,7 @@ def generate_simulations(cfg, args):
 
     # ── Optionally export .pt copies ──
     if args.format in ("pt", "both"):
-        with h5py.File(h5_path, "r") as f:
-            torch.save(torch.from_numpy(f["theta"][:]), output_dir / "theta.pt")
-            torch.save(torch.from_numpy(f["x"][:]), output_dir / "x.pt")
-        print("  Saved theta.pt and x.pt")
+        _export_pt(h5_path, output_dir)
 
     if args.format == "pt":
         Path(h5_path).unlink()

@@ -25,6 +25,7 @@ conf/simulator/*.yaml
 
 conf/training/*.yaml
 !conf/training/density_estimator.yaml
+!conf/training/ratio_estimator.yaml
 !conf/training/test.yaml
 
 # output files

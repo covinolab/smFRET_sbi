@@ -232,6 +232,12 @@ def make_spline_knots(
     num_boundary_knots=3,
     boundary_condition="bound",
 ):
+    # params[1:num_knots] holds the n-1 increments between adjacent knot heights. The first knot height is fixed at 0 for identifiability.
+    # Reconstruct the n centred knot heights via cumsum + zero-mean shift.
+    diffs = np.asarray(params[1:num_knots], dtype=np.float64)
+    y_inner = np.cumsum(np.concatenate(([0.0], diffs)))
+    y_inner -= y_inner.mean()
+
     knot_spacing = (x_max - x_min) / (num_knots - 1)
     x_knots = np.linspace(
         x_min - num_boundary_knots * knot_spacing,
@@ -241,13 +247,13 @@ def make_spline_knots(
     y_knots = np.zeros(num_knots + 2 * num_boundary_knots)
     for i in range(1, num_boundary_knots + 1):
         if boundary_condition == "linear":
-            y_knots[-num_boundary_knots + i] = i * (max_G0 / num_boundary_knots) + params[num_knots]
-            y_knots[num_boundary_knots - i - 1] = i * (max_G0 / num_boundary_knots) + params[1]
+            y_knots[-num_boundary_knots + i] = i * (max_G0 / num_boundary_knots) + y_inner[-1]
+            y_knots[num_boundary_knots - i - 1] = i * (max_G0 / num_boundary_knots) + y_inner[0]
         elif boundary_condition == "quadratic":
-            y_knots[-num_boundary_knots + i - 1] = (i / num_boundary_knots) ** 2 * max_G0 + params[num_knots]
-            y_knots[num_boundary_knots - i] = (i / num_boundary_knots) ** 2 * max_G0 + params[1]
+            y_knots[-num_boundary_knots + i - 1] = (i / num_boundary_knots) ** 2 * max_G0 + y_inner[-1]
+            y_knots[num_boundary_knots - i] = (i / num_boundary_knots) ** 2 * max_G0 + y_inner[0]
 
-    y_knots[num_boundary_knots:-num_boundary_knots] = params[1 : 1 + num_knots]
+    y_knots[num_boundary_knots:-num_boundary_knots] = y_inner
     return x_knots, y_knots
 
 

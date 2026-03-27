@@ -9,8 +9,8 @@ training:
   num_epochs: 50
   seed: 42
   compile: false
-  grad_clip: 0.0
-  checkpoint_interval_minutes: 2
+  grad_clip: 10.0
+  checkpoint_interval_minutes: 0.5
   resume_from: null
 
 optimizer:
@@ -18,17 +18,18 @@ optimizer:
   weight_decay: 0.01
 
 scheduler:
-  max_lr: 5e-3
+  max_lr: 1e-3
   pct_start: 0.3
   final_div_factor: 1e4
 
 embedding:
-  dim: 16
-  dim_mults: [1]
-  attention: false
-  kernel_size: 8
+  dim: 32
+  dim_mults: [1, 2, 4]
+  attention: true
   padding_mode: reflect
-  output_dim: 16
+  kernel_size: 3
+  downsample: 0
+  output_dim: 128
 
 flow:
   model: "maf"
@@ -37,6 +38,11 @@ flow:
   num_blocks: 2
   dropout_probability: 0.1
   use_batch_norm: false
+
+classifier:
+  model: "resnet"
+  hidden_features: 128
+  num_atoms: 10
 
 # Data settings
 data:
@@ -47,7 +53,7 @@ data:
   prefetch_factor: 3
 
 artifacts:
-  model_filename: "npe_density_estimator.pkl"
+  model_filename: "estimator.pkl"
   checkpoint_filename: "checkpoint.pt"
   data_config_copy_filename: "data_config.yaml"
  

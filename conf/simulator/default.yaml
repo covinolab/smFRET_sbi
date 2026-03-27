@@ -25,6 +25,8 @@ prior:
   spline_mean: null           # mean values for spline coefficients (default: zero)
   spline_scale: 10.0
   spline_correlation: 1
+  prior_type: uniform         # "uniform" (independent per-knot), "igmrf" (first/second-difference prior), or "gp" (exponential-decay GP)
+  igmrf_order: 1              # 1=first differences, 2=curvature penalty (only used when prior_type=igmrf)
 
 
 # Fixed simulator parameters (not inferred)

@@ -24,19 +24,27 @@ smFRET_sbi/
 │   ├── priors.py                  # Prior definitions (uniform + correlated spline)
 │   ├── utils.py                   # Spline-knot construction & evaluation helpers
 │   ├── data_loaders.py            # HDF5 iterable dataset with chunk-based I/O
-│   ├── temporal_encoders.py       # 1-D CNN embedding network (ResNet-style)
+│   ├── temporal_encoders.py       # 1-D CNN / Transformer / LRU embedding networks
 │   ├── generate_simulations.py    # CLI for parallel data generation → HDF5
-│   └── train_density_estimator.py # NPE training script (normalizing flow)
+│   ├── merge_h5_shards.py         # Merge sharded HDF5 files into one dataset
+│   ├── train_density_estimator.py # NPE training script (normalizing flow)
+│   └── train_ratio_estimator.py   # Likelihood-ratio estimation (alternative SBI)
 ├── conf/
 │   ├── simulator/                 # Simulator & prior configs (Hydra, YAML)
 │   │   ├── default.yaml           # Default config (tracked)
 │   │   └── test.yaml              # Test config (tracked)
 │   └── training/                  # Training configs (Hydra, YAML)
-│       ├── density_estimator.yaml # Default training config (tracked)
-│       └── test.yaml              # Test training config (tracked)
+│       ├── density_estimator.yaml # Default NPE training config (tracked)
+│       ├── ratio_estimator.yaml   # Likelihood-ratio training config (tracked)
+│       ├── test.yaml              # Test training config (tracked)
+│       └── embedding/             # Encoder config group
+│           ├── cnn.yaml           # CNN encoder hyperparameters
+│           ├── transformer.yaml   # Transformer encoder hyperparameters
+│           └── lru.yaml           # LRU encoder hyperparameters
 ├── analysis/                      # Evaluation & exploration notebooks
-│   ├── eval_posterior.ipynb        # Posterior visualisation
-│   └── setup_prior.ipynb          # Prior inspection & setup
+│   ├── eval_posterior.ipynb           # Posterior visualisation
+│   ├── eval_likelihood_ratios.ipynb   # Likelihood-ratio evaluation
+│   └── setup_prior.ipynb              # Prior inspection & setup
 ├── data/                          # Generated training data (HDF5, not tracked)
 ├── outputs/                       # Hydra-managed training outputs (not tracked)
 └── README.md
@@ -52,14 +60,14 @@ The core simulator (`smFRET_simulator.pyx`) integrates Langevin dynamics on a sp
 2. **FRET efficiency** — $E(r) = R_0^6 / (R_0^6 + r^6)$.
 3. **Photon detection** — Poisson-distributed photon counts with cross-talk, background, and quantum-efficiency corrections.
 
-The free-energy landscape is parameterised by spline knot values drawn from a correlated multivariate normal prior, enabling flexible, non-parametric potentials.
+The free-energy landscape is parameterised by spline knot height increments (Δᵢ = φᵢ₊₁ − φᵢ), each drawn independently from a uniform prior. Absolute knot values are reconstructed for simulation and visualization via cumulative sum and then zero-mean centred for identifiability.
 
 ### Parameters
 
 | Group | Parameters | Description |
 |-------|-----------|-------------|
 | Dynamics | `logD` | Log-diffusion coefficient |
-| Potential | `spline_coeffs` (×`num_knots`) | Spline knot values defining $U(x)$ |
+| Potential | `delta_phi` (×`num_knots−1`) | Knot height increments defining $U(x)$ |
 | FRET | `R0`, `kD` | Förster radius, donor excitation rate |
 | Background | `k_gb`, `k_rb` | Green/red background photon rates |
 | Detectors | `eta_g`, `eta_r` | Green/red quantum efficiencies |
@@ -146,28 +154,53 @@ Override any config value from the command line:
 python src/train_density_estimator.py training.num_epochs=300 embedding.output_dim=256
 ```
 
-Select a different temporal encoder (CNN / Transformer) and tune only that encoder's hyperparameters:
+Select a different temporal encoder and tune its hyperparameters:
 
 ```bash
+# CNN encoder (default)
+python src/train_density_estimator.py embedding=cnn embedding.dim=16 embedding.kernel_size=9
+
 # Transformer encoder
 python src/train_density_estimator.py embedding=transformer embedding.depth=6 embedding.num_heads=8
 
-# CNN encoder
-python src/train_density_estimator.py embedding=cnn embedding.dim=16 embedding.kernel_size=9
+# LRU encoder
+python src/train_density_estimator.py embedding=lru
 ```
 
-Encoder configs live in `conf/training/embedding/` (Hydra config group):
+Encoder configs live in `conf/training/embedding/` (Hydra config group): `cnn`, `transformer`, `lru`.
 
-- `embedding=cnn` with `embedding.*` CNN hyperparameters
-- `embedding=transformer` with `embedding.*` Transformer hyperparameters
+**Multi-GPU training** with DDP:
 
-Training logs are written to TensorBoard under the Hydra output directory (`outputs/density_estimator/<date>/<time>/`).
+```bash
+torchrun --nproc_per_node=8 src/train_density_estimator.py
+```
+
+Training logs are written to TensorBoard under the Hydra output directory (`outputs/<date>/<time>/`).
+
+### 2b. Train a Likelihood-Ratio Estimator (alternative)
+
+As an alternative to NPE, a likelihood-ratio estimator can be trained to discriminate between the prior and the posterior:
+
+```bash
+python src/train_ratio_estimator.py
+```
+
+This uses the config at `conf/training/ratio_estimator.yaml` and supports the same Hydra overrides as the density estimator.
+
+### 2c. Merge HDF5 Shards
+
+If data was generated in parallel shards, merge them before training:
+
+```bash
+python src/merge_h5_shards.py --input-dir data/exp_1_data_shards --output data/exp_1_data/data.h5
+```
 
 ### 3. Evaluate
 
-Use the notebooks in `analysis/` to load trained models and inspect posteriors on test data:
+Use the notebooks in `analysis/` to load trained models and inspect results:
 
 - `eval_posterior.ipynb` — sample and visualise the posterior
+- `eval_likelihood_ratios.ipynb` — evaluate likelihood-ratio estimators
 - `setup_prior.ipynb` — inspect and configure priors
 
 ## Data Loading
@@ -179,6 +212,6 @@ Use the notebooks in `analysis/` to load trained models and inspect posteriors o
 | Tracked | Not tracked |
 |---------|-------------|
 | All `src/*.py`, `src/*.pyx`, `src/*.pxd` | `src/build/`, `__pycache__/`, `*.so`, `*.c` (generated) |
-| `conf/**/default.yaml`, `conf/**/test.yaml` | Experiment config variants |
+| `conf/**/default.yaml`, `conf/**/test.yaml`, `conf/**/ratio_estimator.yaml`, `conf/training/embedding/*.yaml` | Experiment-specific config variants |
 | `analysis/*.ipynb` (code only, outputs stripped) | `data/`, `outputs/` |
 | `README.md`, `.gitignore` | `*.pt`, `*.pkl`, images |

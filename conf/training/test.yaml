@@ -6,7 +6,7 @@ defaults:
 training:
   batch_size: 128
   validation_fraction: 0.1
-  num_epochs: 50
+  num_epochs: 20
   seed: 42
   compile: false
   grad_clip: 10.0
@@ -41,10 +41,11 @@ flow:
 
 classifier:
   hidden_features: 128
-  num_atoms: 100
-  dropout_probability: 0.2
+  num_atoms: 20
+  dropout_probability: 0.1
   num_blocks : 2
   use_batch_norm: false
+  regularization_strength: 0.1
 
 # Data settings
 data:

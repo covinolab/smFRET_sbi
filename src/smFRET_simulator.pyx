@@ -140,7 +140,7 @@ def smFRET_simulator(
 
     # State variables
     cdef double xold = x0
-    cdef double xnew, Fx, spline_deriv
+    cdef double xnew, Fx, spline_val
     cdef double r, r_6, E, phi_g, phi_r, lambda_g, lambda_r
     cdef unsigned int n_g, n_r
     cdef int status = 0
@@ -153,12 +153,12 @@ def smFRET_simulator(
     # Main integration loop
     for i in range(1, N):
 
-        # Evaluate force from spline potential: F = -dU/dx
-        status = _gsl_spline.gsl_spline_eval_deriv_e(spline, xold, acc, &spline_deriv)
+        # Evaluate force directly from gradient spline: F = g(x)
+        status = _gsl_spline.gsl_spline_eval_e(spline, xold, acc, &spline_val)
         if status != 0:
             break
 
-        Fx = -spline_deriv
+        Fx = spline_val
 
         # Langevin integration step
         xnew = xold + Ax * Fx + Bx * grn.gsl_ran_gaussian_ziggurat(rng, 1.0)

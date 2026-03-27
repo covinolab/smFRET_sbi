@@ -102,21 +102,33 @@ def classifier_logits(net, theta, x, num_atoms):
     return net.net(input_to_classifier)
 
 
-def classifier_losses(net, theta, x, num_atoms):
+def classifier_losses(net, theta, x, num_atoms, regularization_strength=0.0):
     logits = classifier_logits(net, theta, x, num_atoms)
     logits = logits.reshape(theta.shape[0], num_atoms)
+
+    # NRE loss
     log_probs = logits[:, 0] - torch.logsumexp(logits, dim=-1)
-    return -log_probs
+    loss = -log_probs
+
+    # BNRE regularizer
+    if regularization_strength > 0:
+        joint_probs = torch.sigmoid(logits[:, 0:1])
+        marginal_probs = torch.sigmoid(logits[:, 1:])
+        regularizer = (joint_probs + marginal_probs - 1).mean().square()
+        loss = loss + regularization_strength * regularizer
+
+    return loss
 
 
 class _LossForward(torch.nn.Module):
-    def __init__(self, model, num_atoms):
+    def __init__(self, model, num_atoms, regularization_strength):
         super().__init__()
         self.wrapped = model
         self.num_atoms = int(num_atoms)
+        self.regularization_strength = regularization_strength
 
     def forward(self, theta, x):
-        return classifier_losses(self.wrapped, theta, x, self.num_atoms)
+        return classifier_losses(self.wrapped, theta, x, self.num_atoms, self.regularization_strength)
 
 
 def _train_one_epoch(
@@ -344,7 +356,8 @@ def train(cfg: DictConfig) -> float:
     log.info(f"Training seed: {training_seed}")
     log.info(f"Total trainable parameters: {num_trainable_parameters:,}")
 
-    loss_forward = _LossForward(ratio_estimator, num_atoms)
+    regularization_strength = cfg.classifier.regularization_strength
+    loss_forward = _LossForward(ratio_estimator, num_atoms, regularization_strength)
     if ddp:
         local_rank = int(os.environ["LOCAL_RANK"])
         loss_forward = DDP(loss_forward, device_ids=[local_rank])
@@ -428,7 +441,7 @@ def train(cfg: DictConfig) -> float:
             device, grad_clip, ddp,
         )
         val_loss, skipped_val_batches_total = _validate_one_epoch(
-            ratio_estimator, val_loader, num_atoms, device, ddp,
+            ratio_estimator, val_loader, num_atoms,  device, ddp,
         )
 
         epoch_time = time.time() - epoch_start

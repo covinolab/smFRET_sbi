@@ -8,7 +8,7 @@ cimport numpy as cnp
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def spline(
+def eval_spline(
         cnp.ndarray[double] x_knots,
         cnp.ndarray[double] y_knots,
         cnp.ndarray[double] x_eval,
@@ -75,3 +75,69 @@ def spline(
         return None
 
     return y_eval
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def integrate_spline(
+        cnp.ndarray[double] x_knots,
+        cnp.ndarray[double] y_knots,
+        cnp.ndarray[double] x_eval,
+        str spline_type='cubic'
+        ):
+    """Cumulative integral of a spline from x_eval[0] to each x_eval[i].
+
+    Uses gsl_spline_eval_integ_e, which computes the exact definite integral
+    of the piecewise polynomial representation (not numerical quadrature).
+
+    Returns
+    -------
+    result : ndarray, shape (len(x_eval),)
+        result[i] = ∫_{x_eval[0]}^{x_eval[i]} y(x) dx
+    """
+
+    cdef int N_knots = len(x_knots)
+    cdef int N_eval = len(x_eval)
+
+    cdef double *x_k = <double *> malloc(N_knots * sizeof(double))
+    cdef double *y_k = <double *> malloc(N_knots * sizeof(double))
+
+    for i in range(N_knots):
+        x_k[i] = x_knots[i]
+        y_k[i] = y_knots[i]
+
+    cdef _gsl_spline.gsl_interp_accel *acc
+    acc = _gsl_spline.gsl_interp_accel_alloc()
+    cdef _gsl_spline.gsl_spline *sp
+
+    if spline_type == "cubic":
+        sp = _gsl_spline.gsl_spline_alloc(_gsl_spline.gsl_interp_cspline, N_knots)
+    elif spline_type == "steffen":
+        sp = _gsl_spline.gsl_spline_alloc(_gsl_spline.gsl_interp_steffen, N_knots)
+    elif spline_type == "akima":
+        sp = _gsl_spline.gsl_spline_alloc(_gsl_spline.gsl_interp_akima, N_knots)
+    else:
+        raise ValueError(f"Unsupported spline type: {spline_type}")
+
+    _gsl_spline.gsl_spline_init(sp, x_k, y_k, N_knots)
+
+    cdef cnp.ndarray[double] result = np.zeros(N_eval, dtype=np.double)
+    cdef double tmp_integ
+    cdef double x0 = x_eval[0]
+    cdef int status = 0
+
+    for i in range(N_eval):
+        status = _gsl_spline.gsl_spline_eval_integ_e(sp, x0, x_eval[i], acc, &tmp_integ)
+        if status != 0:
+            break
+        result[i] = tmp_integ
+
+    _gsl_spline.gsl_spline_free(sp)
+    _gsl_spline.gsl_interp_accel_free(acc)
+    free(x_k)
+    free(y_k)
+
+    if status != 0:
+        return None
+
+    return result

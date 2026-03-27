@@ -21,9 +21,9 @@ prior:
   C_gr_lims: [0.0, 0.2]        # Prob green photon -> red detector
   C_rg_lims: [0.0, 0.2]        # Prob red photon -> green detector
 
-  num_knots: 5                # number of spline knots for potential
-  center: null           # mean values for spline coefficients (default: zero)
-  scale: 7.0
+  num_knots: 4                # number of spline knots for potential
+  center: [-0.5, -0.1, 0.1, 0.5]           # mean values for spline coefficients (default: zero)
+  scale: 1
 
 
 # Fixed simulator parameters (not inferred)
@@ -32,9 +32,9 @@ simulator:
   saving_frequency: 1500
   time_step: 5e-4
   spline_type: "cubic"
-  boundary_condition: "linear"
-  num_boundary_knots: 3
-  max_G0: 30.0
+  boundary_condition: "linear"  # "quadratic" or "linear"
+  num_boundary_knots: 6
+  max_force: 60.0
   x_min: 4.0
   x_max: 14.0
   x_init: [4.0, 14.0]

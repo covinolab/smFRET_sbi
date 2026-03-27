@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from gsl_spline import spline
+from gsl_spline import eval_spline, integrate_spline
 
 
 def git_commit(repo_dir: Path) -> str:
@@ -228,15 +228,13 @@ def make_spline_knots(
     x_min=0.0,
     x_max=10.0,
     num_knots=10,
-    max_G0=10.0,
+    max_force=10.0,
     num_boundary_knots=3,
     boundary_condition="bound",
 ):
-    # params[1:num_knots] holds the n-1 increments between adjacent knot heights. The first knot height is fixed at 0 for identifiability.
-    # Reconstruct the n centred knot heights via cumsum + zero-mean shift.
-    diffs = np.asarray(params[1:num_knots], dtype=np.float64)
-    y_inner = np.cumsum(np.concatenate(([0.0], diffs)))
-    y_inner -= y_inner.mean()
+    # params[1:num_knots+1] holds all n gradient knots g₀…gₙ₋₁.
+    # No anchor is needed: force has no additive ambiguity.
+    g_inner = np.asarray(params[1:num_knots + 1], dtype=np.float64)
 
     knot_spacing = (x_max - x_min) / (num_knots - 1)
     x_knots = np.linspace(
@@ -247,24 +245,58 @@ def make_spline_knots(
     y_knots = np.zeros(num_knots + 2 * num_boundary_knots)
     for i in range(1, num_boundary_knots + 1):
         if boundary_condition == "linear":
-            y_knots[-num_boundary_knots + i] = i * (max_G0 / num_boundary_knots) + y_inner[-1]
-            y_knots[num_boundary_knots - i - 1] = i * (max_G0 / num_boundary_knots) + y_inner[0]
+            # Right boundary: force becomes increasingly negative (pushing inward)
+            y_knots[-num_boundary_knots + i] = g_inner[-1] - i * (max_force / num_boundary_knots)
+            # Left boundary: force becomes increasingly positive (pushing inward)
+            y_knots[num_boundary_knots - i - 1] = g_inner[0] + i * (max_force / num_boundary_knots)
         elif boundary_condition == "quadratic":
-            y_knots[-num_boundary_knots + i - 1] = (i / num_boundary_knots) ** 2 * max_G0 + y_inner[-1]
-            y_knots[num_boundary_knots - i] = (i / num_boundary_knots) ** 2 * max_G0 + y_inner[0]
+            y_knots[-num_boundary_knots + i - 1] = g_inner[-1] - (i / num_boundary_knots) ** 2 * max_force
+            y_knots[num_boundary_knots - i] = g_inner[0] + (i / num_boundary_knots) ** 2 * max_force
 
-    y_knots[num_boundary_knots:-num_boundary_knots] = y_inner
+    y_knots[num_boundary_knots:-num_boundary_knots] = g_inner
     return x_knots, y_knots
 
 
-def eval_spline(
+def integrate_force_to_energy(x_knots, g_knots, x_eval, spline_type="cubic"):
+    """Recover U(x) = -∫F(x)dx via the GSL spline integral.
+
+    Integrates the force spline analytically (exact for the piecewise
+    polynomial) using gsl_spline_eval_integ_e. The additive constant is
+    fixed by pinning the minimum of U to zero.
+
+    Parameters
+    ----------
+    x_knots : array_like
+        x-positions of the force spline knots (with boundary knots).
+    g_knots : array_like
+        Force values at the knots (output of make_spline_knots).
+    x_eval : np.ndarray
+        Positions at which to evaluate U(x).
+    spline_type : str
+        GSL spline type ("cubic", "steffen", or "akima").
+
+    Returns
+    -------
+    U : np.ndarray, shape (len(x_eval),)
+        Free energy profile, with min(U) = 0.
+    """
+    U = -integrate_spline(
+        np.asarray(x_knots, dtype=np.float64),
+        np.asarray(g_knots, dtype=np.float64),
+        np.asarray(x_eval, dtype=np.float64),
+        spline_type,
+    )
+    return U
+
+
+def eval_free_energy(
     params,
     x_eval,
     N_knots,
     x_min,
     x_max,
     boundary_condition,
-    max_G0,
+    max_force,
     spline_type="cubic",
     num_boundary_knots=4,
 ):
@@ -276,24 +308,65 @@ def eval_spline(
         x_min=x_min,
         x_max=x_max,
         num_knots=N_knots,
-        max_G0=max_G0,
+        max_force=max_force,
         boundary_condition=boundary_condition,
         num_boundary_knots=num_boundary_knots,
     )
 
-    y = spline(x_knots, y_knots, x_eval, spline_type=spline_type)
+    y = integrate_force_to_energy(x_knots, y_knots, x_eval, spline_type=spline_type)
     return x_eval, y
 
 
-def eval_spline_from_config(cfg):
+def eval_free_energy_from_config(cfg):
     cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
     return partial(
-        eval_spline,
+        eval_free_energy,
         N_knots=cfg.prior.num_knots,
         x_min=cfg.simulator.x_min,
         x_max=cfg.simulator.x_max,
         boundary_condition=cfg.simulator.boundary_condition,
-        max_G0=cfg.simulator.max_G0,
+        max_force=cfg.simulator.max_force,
+        spline_type=cfg.simulator.spline_type,
+        num_boundary_knots=cfg.simulator.num_boundary_knots,
+    )
+
+
+def eval_force(
+    params,
+    x_eval,
+    N_knots,
+    x_min,
+    x_max,
+    boundary_condition,
+    max_force,
+    spline_type="cubic",
+    num_boundary_knots=4,
+):
+    if isinstance(params, torch.Tensor):
+        params = params.detach().cpu().numpy()
+
+    x_knots, y_knots = make_spline_knots(
+        params=params,
+        x_min=x_min,
+        x_max=x_max,
+        num_knots=N_knots,
+        max_force=max_force,
+        boundary_condition=boundary_condition,
+        num_boundary_knots=num_boundary_knots,
+    )
+
+    y = eval_spline(x_knots, y_knots, x_eval, spline_type=spline_type)
+    return x_eval, y
+
+def eval_force_from_config(cfg):
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+    return partial(
+        eval_force,
+        N_knots=cfg.prior.num_knots,
+        x_min=cfg.simulator.x_min,
+        x_max=cfg.simulator.x_max,
+        boundary_condition=cfg.simulator.boundary_condition,
+        max_force=cfg.simulator.max_force,
         spline_type=cfg.simulator.spline_type,
         num_boundary_knots=cfg.simulator.num_boundary_knots,
     )

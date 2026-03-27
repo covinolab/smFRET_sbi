@@ -14,7 +14,7 @@ def smFRET_simulator_wrapper(
                 x_min=0.0,
                 x_max=10.0,
                 num_knots=10,
-                max_G0=10.0,
+                max_force=10.0,
                 boundary_condition='diffusive',
                 spline_type="cubic",
                 num_boundary_knots=4,
@@ -27,7 +27,7 @@ def smFRET_simulator_wrapper(
             x_min=x_min,
             x_max=x_max,
             num_knots=num_knots,
-            max_G0=max_G0,
+            max_force=max_force,
             boundary_condition=boundary_condition,  
             num_boundary_knots=num_boundary_knots
         )
@@ -37,16 +37,16 @@ def smFRET_simulator_wrapper(
                 Dx=10**params[0],
                 x_knots=x_knots,
                 y_knots=y_knots,
-                R0=params[num_knots],
-                kD=params[1+num_knots],
-                k_gb=params[2+num_knots],
-                k_rb=params[3+num_knots],
-                eta_g=params[4+num_knots],
-                eta_r=params[5+num_knots],
-                C_gg=params[6+num_knots],
-                C_rr=params[7+num_knots],
-                C_gr=params[8+num_knots],
-                C_rg=params[9+num_knots],
+                R0=params[num_knots+1],
+                kD=params[num_knots+2],
+                k_gb=params[num_knots+3],
+                k_rb=params[num_knots+4],
+                eta_g=params[num_knots+5],
+                eta_r=params[num_knots+6],
+                C_gg=params[num_knots+7],
+                C_rr=params[num_knots+8],
+                C_gr=params[num_knots+9],
+                C_rg=params[num_knots+10],
                 T=T,
                 saving_freq=saving_freq,
                 dt=dt,
@@ -85,7 +85,7 @@ def smFRET_simulator_wrapper_from_config(cfg: str):
     spline_type = cfg.simulator.spline_type
     boundary_condition = cfg.simulator.boundary_condition
     num_knots = cfg.prior.num_knots
-    max_G0 = cfg.simulator.max_G0
+    max_force = cfg.simulator.max_force
     x_min = cfg.simulator.x_min
     x_max = cfg.simulator.x_max
     num_boundary_knots = cfg.simulator.num_boundary_knots
@@ -100,7 +100,7 @@ def smFRET_simulator_wrapper_from_config(cfg: str):
         x_min=x_min,
         x_max=x_max,
         num_knots=num_knots,
-        max_G0=max_G0,
+        max_force=max_force,
         boundary_condition=boundary_condition,
         spline_type=spline_type,
         num_boundary_knots=num_boundary_knots,

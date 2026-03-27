@@ -186,7 +186,7 @@ def _get_sim_kwargs(cfg):
         x_max=cfg.simulator.x_max,
         x_init=tuple(cfg.simulator.x_init),
         num_knots=cfg.prior.num_knots,
-        max_G0=cfg.simulator.max_G0,
+        max_force=cfg.simulator.max_force,
         boundary_condition=cfg.simulator.boundary_condition,
         spline_type=cfg.simulator.spline_type,
     )
@@ -256,7 +256,7 @@ def generate_simulations(cfg, args):
     num_workers = args.num_workers or cfg.data_generation.num_workers
     batch_size = cfg.data_generation.batch_size
     chunk_size = args.chunk_size or cfg.data_generation.chunk_size
-    theta_dim = cfg.prior.num_knots
+    theta_dim = cfg.prior.num_knots + 1
 
     prior = generate_fret_prior_from_config(cfg, device="cpu")
     sim_kwargs = _get_sim_kwargs(cfg)

@@ -56,7 +56,7 @@ smFRET_sbi/
 
 The core simulator (`smFRET_simulator.pyx`) integrates Langevin dynamics on a spline-defined free-energy potential and produces two-channel (green/red) photon count traces:
 
-1. **Dynamics** — Overdamped Langevin where the force derived from potential $U(x)$ parametirzed by  cubic spline interpolation. (dx = -D * dU/dx * dt + sqrt(2D*dt)*N(0,1))
+1. **Dynamics** — Overdamped Langevin where the force is derived from potential $U(x)$ parameterized by cubic spline interpolation. (dx = -D * dU/dx * dt + sqrt(2D*dt)*N(0,1))
 2. **FRET efficiency** — $E(r) = R_0^6 / (R_0^6 + r^6)$.
 3. **Photon detection** — Poisson-distributed photon counts with cross-talk, background, and quantum-efficiency corrections.
 
@@ -83,6 +83,7 @@ The free-energy landscape is parameterised by spline knot height increments (Δ�
 | `x_min` / `x_max` | 4.0 / 14.0 | Position of first and last knot |
 | `boundary_condition` | `linear` | Setup of boundary conditions |
 | `num_boundary_knots` | 3 | Number of boundary knots |
+| `spline_type` | `cubic` | Interpolation type for the free-energy potential |
 
 ## Installation
 
@@ -91,6 +92,14 @@ The free-energy landscape is parameterised by spline knot height increments (Δ�
 - Python ≥ 3.9
 - GSL (GNU Scientific Library) — required by the Cython simulator
 - CUDA-capable GPU (optional, for faster training)
+
+### Python Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Key packages: `torch`, `sbi`, `hydra-core`, `h5py`, `einops`, `numpy`, `cython`.
 
 ### Build Cython Extensions
 
@@ -101,10 +110,6 @@ python build_cython.py
 
 This compiles `smFRET_simulator.pyx` and `gsl_spline.pyx` into shared libraries (`.so`) that can be imported from Python.
 
-### Python Dependencies
-
-Key packages: `torch`, `sbi`, `hydra-core`, `h5py`, `einops`, `numpy`, `cython`.
-
 ## Usage
 
 ### 1. Generate Training Data
@@ -112,10 +117,10 @@ Key packages: `torch`, `sbi`, `hydra-core`, `h5py`, `einops`, `numpy`, `cython`.
 ```bash
 python src/generate_simulations.py \
     --config conf/simulator/default.yaml \
-    --format h5
+    --num-workers 80
 ```
 
-Override config values from the command line:
+Override additional config values from the command line:
 
 ```bash
 python src/generate_simulations.py \
@@ -128,9 +133,9 @@ python src/generate_simulations.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config`, `-c` | `conf/simulator/default.yaml` | Path to YAML config |
+| `--config`, `-c` | *(required)* | Path to YAML config |
+| `--num-workers`, `-w` | *(required)* | Number of parallel worker processes |
 | `--num-simulations`, `-n` | from config | Override simulation count |
-| `--num-workers`, `-w` | from config | Override parallel workers |
 | `--output-dir`, `-o` | from config | Override output directory |
 | `--format`, `-f` | `h5` | Output format: `h5`, `pt`, or `both` |
 | `--chunk-size` | batch size | HDF5 chunk size |
@@ -142,7 +147,7 @@ Outputs an HDF5 file under `data/` with `theta` (parameters) and `x` (photon tra
 
 Training uses [Hydra](https://hydra.cc) for configuration management.
 
-**Neural Posterior Estimation (NPE)** — learns $p(\theta \mid x)$ with a normalizing flow (MAF):
+**Neural Posterior Estimation (NPE)** — learns $p(\theta \mid x)$ with a normalizing flow (MAF with Rational-Quadratic Spline transforms):
 
 ```bash
 python src/train_density_estimator.py

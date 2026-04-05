@@ -88,13 +88,15 @@ def generate_spline_fret_prior(
     return MultipleIndependent([prior_logD, *prior_spline, *phys_priors], device=device)
 
 
-def generate_fret_prior_from_config(cfg: OmegaConf, device: str = "cpu") -> MultipleIndependent:
+def generate_fret_prior_from_config(cfg, device: str = "cpu") -> MultipleIndependent:
     """
     Build the full FRET prior from an OmegaConf config object.
 
     Relevant config keys under ``prior:``:
         num_knots, scale, center (null = flat), logD_lims … C_rg_lims.
     """
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+
     center = None
     if cfg.prior.center is not None:
         center = list(cfg.prior.center)

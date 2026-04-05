@@ -4,26 +4,26 @@ prior:
   logD_lims: [-0.5, 2]       # log10 of diffusion coefficient
   
   # FRET parameters  
-  R0_lims: [6.0, 12.0]          # Förster radius
+  R0_lims: [7.5, 12.5]          # Förster radius
   kD_lims: [0.1, 10.0]         # Donor excitation rate
   
   # Background rates
-  k_gb_lims: [0.0, 0.25]        # Green photon background rate
-  k_rb_lims: [0.0, 0.25]        # Red photon background rate
+  k_gb_lims: [0.0, 0.05]        # Green photon background rate
+  k_rb_lims: [0.0, 0.05]        # Red photon background rate
   
   # Detector efficiencies
-  eta_g_lims: [0.7, 1.0]       # Green detector quantum efficiency
-  eta_r_lims: [0.7, 1.0]       # Red detector quantum efficiency
+  eta_g_lims: [0.95, 1.0]       # Green detector quantum efficiency
+  eta_r_lims: [0.95, 1.0]       # Red detector quantum efficiency
   
   # Cross-talk matrix (spectral bleed-through)
-  C_gg_lims: [0.8, 1.0]        # Prob green photon -> green detector
-  C_rr_lims: [0.8, 1.0]        # Prob red photon -> red detector
-  C_gr_lims: [0.0, 0.2]        # Prob green photon -> red detector
-  C_rg_lims: [0.0, 0.2]        # Prob red photon -> green detector
+  C_gg_lims: [0.95, 1.0]        # Prob green photon -> green detector
+  C_rr_lims: [0.95, 1.0]        # Prob red photon -> red detector
+  C_gr_lims: [0.0, 0.05]        # Prob green photon -> red detector
+  C_rg_lims: [0.0, 0.05]        # Prob red photon -> green detector
 
-  num_knots: 4                # number of spline knots for potential
-  center: [-0.5, -0.1, 0.1, 0.5]           # mean values for spline coefficients (default: zero)
-  scale: 1
+  num_knots: 3                # number of spline knots for potential
+  center: [-0.3, 0.0, 0.3]           # mean values for spline coefficients (default: zero)
+  scale: 0.5
 
 
 # Fixed simulator parameters (not inferred)
@@ -35,9 +35,9 @@ simulator:
   boundary_condition: "linear"  # "quadratic" or "linear"
   num_boundary_knots: 6
   max_force: 60.0
-  x_min: 4.0
-  x_max: 14.0
-  x_init: [4.0, 14.0]
+  x_min: 6.0
+  x_max: 13.0
+  x_init: [6.0, 14.0]
 
 
 data_generation:

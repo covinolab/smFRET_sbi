@@ -91,6 +91,7 @@ class H5Dataset(IterableDataset):
 
         with h5py.File(self.file_path, 'r') as f:
             self._total_len = len(f['theta'])
+            self._has_lengths = 'lengths' in f
 
         self._file = None
 
@@ -171,14 +172,20 @@ class H5Dataset(IterableDataset):
 
         return total_batches
 
-    def __getitem__(self, i: Union[int, slice]) -> Tuple[Tensor, Tensor]:
+    @property
+    def has_lengths(self) -> bool:
+        """Whether this dataset contains variable-length traces with stored lengths."""
+        return self._has_lengths
+
+    def __getitem__(self, i: Union[int, slice]) -> Tuple[Tensor, ...]:
         """Random access for initialization (uses contiguous reads)."""
         f = self._get_file()
-        theta, x = f['theta'][i], f['x'][i]
-        return (
-            torch.from_numpy(theta.astype(np.float32)),
-            torch.from_numpy(x.astype(np.float32)),
-        )
+        theta = torch.from_numpy(f['theta'][i].astype(np.float32))
+        x = torch.from_numpy(f['x'][i].astype(np.float32))
+        if self._has_lengths:
+            lengths = torch.from_numpy(np.asarray(f['lengths'][i], dtype=np.int64))
+            return theta, x, lengths
+        return theta, x
 
     def _get_worker_chunks(self) -> List[int]:
         """Return chunks assigned to this worker."""
@@ -187,7 +194,7 @@ class H5Dataset(IterableDataset):
             return self._chunk_list
         return self._partition_chunks(self._chunk_list, worker_info.num_workers, worker_info.id)
 
-    def __iter__(self) -> Iterator[Tuple[Tensor, Tensor]]:
+    def __iter__(self) -> Iterator[Tuple[Tensor, ...]]:
         f = self._get_file()
 
         worker_chunks = self._get_worker_chunks()
@@ -205,21 +212,37 @@ class H5Dataset(IterableDataset):
 
             theta = np.concatenate([f['theta'][s:e] for s, e in intervals])
             x = np.concatenate([f['x'][s:e] for s, e in intervals])
-
             theta = torch.from_numpy(theta.astype(np.float32))
             x = torch.from_numpy(x.astype(np.float32))
+
+            if self._has_lengths:
+                lengths = np.concatenate([f['lengths'][s:e] for s, e in intervals])
+                lengths = torch.from_numpy(lengths.astype(np.int64))
+            else:
+                lengths = None
 
             if self.shuffle:
                 order = torch.randperm(len(theta))
                 theta, x = theta[order], x[order]
+                if lengths is not None:
+                    lengths = lengths[order]
 
             if self.batch_size is None:
-                yield from zip(theta, x)
+                if lengths is not None:
+                    yield from zip(theta, x, lengths)
+                else:
+                    yield from zip(theta, x)
             else:
-                for tb, xb in zip(theta.split(self.batch_size), x.split(self.batch_size)):
+                theta_splits = theta.split(self.batch_size)
+                x_splits = x.split(self.batch_size)
+                lengths_splits = lengths.split(self.batch_size) if lengths is not None else [None] * len(theta_splits)
+                for tb, xb, lb in zip(theta_splits, x_splits, lengths_splits):
                     if self.drop_last and len(tb) < self.batch_size:
                         continue
-                    yield tb, xb
+                    if lb is not None:
+                        yield tb, xb, lb
+                    else:
+                        yield tb, xb
 
     def __del__(self):
         if self._file is not None:

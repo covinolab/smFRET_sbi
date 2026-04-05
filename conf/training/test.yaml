@@ -1,59 +1,54 @@
 
 defaults:
-  - embedding: cnn
+  - embedding: lru
   - _self_
 
 training:
-  batch_size: 128
+  batch_size: 132
   validation_fraction: 0.1
   num_epochs: 20
   seed: 42
   compile: false
   grad_clip: 10.0
-  checkpoint_interval_minutes: 0.5
+  checkpoint_interval_minutes: 5
   resume_from: null
 
 optimizer:
-  lr: 1e-3
+  lr: 5e-4
   weight_decay: 0.01
 
-scheduler:
-  max_lr: 5e-4
-  pct_start: 0.3
-  final_div_factor: 1e4
-
 embedding:
-  dim: 32
-  dim_mults: [1, 2, 4]
-  attention: true
-  padding_mode: reflect
-  kernel_size: 3
-  downsample: 0
-  output_dim: 128
+    dim: 8
+    dim_mults: [1, 2]
+    attention: true
+    padding_mode: reflect
+    kernel_size: 16
+    downsample: 8
+    output_dim: 64
 
 flow:
   model: "maf"
-  hidden_features: 32
-  num_transforms: 1
+  hidden_features: 64
+  num_transforms: 4
   num_blocks: 2
   dropout_probability: 0.1
-  use_batch_norm: false
+  use_batch_norm: true
 
 classifier:
-  hidden_features: 128
-  num_atoms: 20
-  dropout_probability: 0.1
-  num_blocks : 2
-  use_batch_norm: false
-  regularization_strength: 0.1
+  hidden_features: 64
+  num_atoms: 32
+  dropout_probability: 0.05
+  num_blocks : 6
+  use_batch_norm: true
+  regularization_strength: 0.0
 
 # Data settings
 data:
   data_dir: "data/test"
   chunk_size: 128
-  chunk_step: 1
+  chunk_step: 12
   num_workers: 2
-  prefetch_factor: 3
+  prefetch_factor: 4
 
 artifacts:
   model_filename: "estimator.pkl"

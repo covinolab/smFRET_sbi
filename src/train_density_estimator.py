@@ -42,6 +42,12 @@ from utils import (
 log = logging.getLogger(__name__)
 
 
+def _augment_with_mask(x, lengths):
+    """Append binary mask channel: 1=valid, 0=padded. x: [batch, T, 2] -> [batch, T, 3]"""
+    mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+    return torch.cat([x, mask.unsqueeze(-1).float()], dim=-1)
+
+
 class _LossForward(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -49,6 +55,16 @@ class _LossForward(torch.nn.Module):
 
     def forward(self, theta, x):
         return self.wrapped.loss(theta, x)
+
+
+def _unpack_batch(batch, device):
+    """Unpack a batch from the data loader, augmenting with mask channel if lengths present."""
+    if len(batch) == 3:
+        theta_batch, x_batch, lengths_batch = batch
+        x_batch = _augment_with_mask(x_batch, lengths_batch)
+    else:
+        theta_batch, x_batch = batch
+    return theta_batch.to(device, non_blocking=True), x_batch.to(device, non_blocking=True)
 
 
 def _train_one_epoch(
@@ -66,10 +82,9 @@ def _train_one_epoch(
     train_samples = 0
     train_steps = 0
     clip_steps = 0
-    for theta_batch, x_batch in train_loader:
+    for batch in train_loader:
+        theta_batch, x_batch = _unpack_batch(batch, device)
         train_steps += 1
-        theta_batch = theta_batch.to(device, non_blocking=True)
-        x_batch = x_batch.to(device, non_blocking=True)
         optimizer.zero_grad()
         train_losses = loss_forward(theta_batch, x_batch)
         train_loss = train_losses.mean()
@@ -105,10 +120,9 @@ def _validate_one_epoch(density_estimator, val_loader, device, ddp):
     val_loss_sum = 0
     val_samples = 0
     with torch.no_grad():
-        for theta_batch, x_batch in val_loader:
-            val_losses = density_estimator.loss(
-                theta_batch.to(device), x_batch.to(device)
-            )
+        for batch in val_loader:
+            theta_batch, x_batch = _unpack_batch(batch, device)
+            val_losses = density_estimator.loss(theta_batch, x_batch)
             val_loss_sum += val_losses.sum().item()
             val_samples += theta_batch.size(0)
 
@@ -159,15 +173,25 @@ def train(cfg: DictConfig) -> float:
     # Get dataset info and init samples
     temp_dataset = H5Dataset(h5_path)
     num_examples = len(temp_dataset)
-    theta_init, x_init = temp_dataset[:100]
+    has_lengths = temp_dataset.has_lengths
+
+    if has_lengths:
+        theta_init, x_init, lengths_init = temp_dataset[:100]
+        x_init = _augment_with_mask(x_init, lengths_init)
+        transition_dim = 3
+        log.info("Binding mode detected (variable-length traces with mask channel)")
+    else:
+        theta_init, x_init = temp_dataset[:100]
+        transition_dim = 2
+
     max_len = x_init.shape[1]
     probe_x = x_init[: min(8, x_init.shape[0])].clone()
     del temp_dataset
 
-    # Build embedding network (CNN / Transformer)
+    # Build embedding network (CNN / Transformer / LRU)
     encoder = build_temporal_encoder(
         cfg_embedding=cfg.embedding,
-        transition_dim=2,
+        transition_dim=transition_dim,
         max_len=max_len
     )
 

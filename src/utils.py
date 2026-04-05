@@ -252,6 +252,8 @@ def make_spline_knots(
         elif boundary_condition == "quadratic":
             y_knots[-num_boundary_knots + i - 1] = g_inner[-1] - (i / num_boundary_knots) ** 2 * max_force
             y_knots[num_boundary_knots - i] = g_inner[0] + (i / num_boundary_knots) ** 2 * max_force
+        else:
+            raise ValueError(f"Unsupported boundary_condition: {boundary_condition}")
 
     y_knots[num_boundary_knots:-num_boundary_knots] = g_inner
     return x_knots, y_knots

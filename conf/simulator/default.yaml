@@ -31,16 +31,25 @@ prior:
 
 # Fixed simulator parameters (not inferred)
 simulator:
-  total_time: 10000.0             
+  mode: "equilibrium"            # "equilibrium" (standard smFRET_simulator) or "binding" (h-transform)
+  total_time: 10000.0
   saving_frequency: 10000
   time_step: 5e-5
   spline_type: "cubic"
   boundary_condition: "linear"
   num_boundary_knots: 3
-  max_G0: 30.0
+  max_force: 30.0
   x_min: 4.0
   x_max: 14.0
   x_init: [4.0, 14.0]
+
+  # Binding mode parameters (only used when mode: "binding")
+  binding:
+    n_grid: 500                  # grid points for h-transform precomputation
+    F_guide_max_factor: 0.1      # guiding force clamp (validated: 0.1 is safe)
+    N_max: 200000000             # max integration steps safety cutoff
+    min_steps: 0                 # reject transition paths shorter than this (0 = no minimum)
+    max_bins: 10000              # padded sequence length for variable-length binding traces
 
 
 data_generation:

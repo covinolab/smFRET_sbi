@@ -1,11 +1,131 @@
-import sbi
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
 import math
+from math import sqrt
 from einops.layers.torch import Rearrange
-from sbi.neural_nets.embedding_nets import LRUEmbedding
+
+
+class LRU(nn.Module):
+    """Single Linear Recurrent Unit with diagonal complex-valued state dynamics."""
+
+    def __init__(self, input_dim, state_dim, r_min, r_max, phase_max, bidirectional):
+        super().__init__()
+        self.state_dim = state_dim
+        self.bidirectional = bidirectional
+        N = state_dim * 2 if bidirectional else state_dim
+
+        # Eigenvalue magnitudes (log-parameterised for stability, see §3.2 Orvieto 2023)
+        r_init = torch.rand(N) * (r_max ** 2 - r_min ** 2) + r_min ** 2
+        self.log_nu    = nn.Parameter(torch.log(-0.5 * torch.log(r_init)))
+        self.log_theta = nn.Parameter(torch.log(phase_max * torch.rand(N)))
+
+        # Glorot-initialised complex projection matrices
+        def _cparam(rows, cols):
+            scale = 1.0 / sqrt(2 * cols)
+            return nn.Parameter(torch.complex(
+                torch.randn(rows, cols) * scale,
+                torch.randn(rows, cols) * scale,
+            ))
+        self.B = _cparam(N, input_dim)
+        self.C = _cparam(input_dim, N)
+        self.D = nn.Parameter(torch.randn(input_dim))
+
+        # Input normalisation factor γ = sqrt(1 - |λ|²)
+        self.log_gamma = nn.Parameter(
+            torch.log(torch.sqrt(1 - torch.exp(-torch.exp(self.log_nu)) ** 2))
+        )
+
+    @property
+    def lambda_complex(self):
+        return torch.exp(-torch.exp(self.log_nu) + 1j * torch.exp(self.log_theta))
+
+    def forward(self, x):
+        # x: [batch, seq, input_dim]
+        gamma = torch.exp(self.log_gamma)
+        B_norm = self.B * gamma.unsqueeze(-1)          # normalised input matrix
+        u = x.to(dtype=B_norm.dtype) @ B_norm.T        # [batch, seq, N]
+
+        if self.bidirectional:
+            # Second half of state sees a time-reversed input stream
+            u = torch.cat([
+                u[..., :self.state_dim],
+                torch.flip(u[..., self.state_dim:], dims=[1]),
+            ], dim=-1)
+
+        # Sequential recurrence  x_t = λ · x_{t-1} + u_t
+        lam = self.lambda_complex
+        x_t = torch.zeros(x.size(0), u.size(-1), dtype=u.dtype, device=x.device)
+        states = []
+        for u_t in u.unbind(dim=1):
+            x_t = lam * x_t + u_t
+            states.append(x_t)
+        states = torch.stack(states, dim=1)            # [batch, seq, N]
+
+        if self.bidirectional:
+            # Restore chronological order for the backward direction
+            states = torch.cat([
+                states[..., :self.state_dim],
+                torch.flip(states[..., self.state_dim:], dims=[1]),
+            ], dim=-1)
+
+        return (states @ self.C.mT).real + x * self.D
+
+
+class LRUBlock(nn.Module):
+    """LRU wrapped with optional normalisation, GELU, gating, dropout, and a skip connection."""
+
+    def __init__(self, hidden_dim, state_dim, r_min, r_max, phase_max,
+                 bidirectional, dropout, apply_input_normalization):
+        super().__init__()
+        self.norm    = nn.LayerNorm(hidden_dim) if apply_input_normalization else nn.Identity()
+        self.lru     = LRU(hidden_dim, state_dim, r_min, r_max, phase_max, bidirectional)
+        self.dropout = nn.Dropout(dropout)
+        self.gate    = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x):
+        y = self.lru(self.norm(x))
+        y = F.gelu(y)
+        y = self.dropout(y)
+        y = y * torch.sigmoid(self.gate(y))   # state-mixing gate (Smith et al. 2023)
+        y = self.dropout(y)
+        return y + x                          # skip connection
+
+
+class LRUEmbedding(nn.Module):
+    """Picklable LRU-based embedding for sequential data (e.g. smFRET traces).
+
+    Differences from sbi's LRUEmbedding:
+      - ``aggregate_fcn`` is stored as a string, not a lambda → fully picklable.
+      - Scan mode removed (uses unstable private PyTorch APIs).
+    """
+
+    def __init__(self, input_dim, output_dim, state_dim=20, hidden_dim=40,
+                 num_blocks=2, r_min=0.0, r_max=1.0, phase_max=2 * math.pi,
+                 bidirectional=True, dropout=0.0,
+                 apply_input_normalization=False, aggregate_fcn="mean"):
+        super().__init__()
+        assert num_blocks >= 1
+        assert aggregate_fcn in ("mean", "last_step"), \
+            f"aggregate_fcn must be 'mean' or 'last_step', got '{aggregate_fcn}'"
+        self.aggregate_fcn = aggregate_fcn   # stored as plain string — picklable
+
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+        self.lru_blocks  = nn.Sequential(*[
+            LRUBlock(hidden_dim, state_dim, r_min, r_max, phase_max,
+                     bidirectional, dropout, apply_input_normalization)
+            for _ in range(num_blocks)
+        ])
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        # x: [batch, seq, input_dim]
+        x = self.input_layer(x)
+        x = self.lru_blocks(x)
+        x = x[:, -1] if self.aggregate_fcn == "last_step" else x.mean(dim=1)
+        return self.output_layer(x)
+
 
 class Downsample1d(nn.Module):
     def __init__(self, dim):
@@ -351,12 +471,11 @@ def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
             num_blocks=int(getattr(cfg_embedding, "num_blocks", 2)),
             r_min=float(getattr(cfg_embedding, "r_min", 0.0)),
             r_max=float(getattr(cfg_embedding, "r_max", 1.0)),
-            phase_max=float(getattr(cfg_embedding, "phase_max", 2 * 3.141592653589793)),
+            phase_max=float(getattr(cfg_embedding, "phase_max", 2 * math.pi)),
             bidirectional=True,
-            mode="loop",
             dropout=float(getattr(cfg_embedding, "dropout", 0.0)),
             apply_input_normalization=False,
-            aggregate_fcn="mean"
+            aggregate_fcn="mean",
         )
     
 

@@ -1,9 +1,9 @@
 name: lru
-state_dim: 20
-hidden_dim: 128
+state_dim: 32
+hidden_dim: 64
 num_blocks: 2
-r_min: 0.0
-r_max: 1.0
-phase_max: 2 * 3.1415
-dropout: 0.1
-output_dim: 128
+r_min: 0.3
+r_max: 0.99
+phase_max: 6.2830
+dropout: 0.05
+output_dim: 64

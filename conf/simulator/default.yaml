@@ -31,7 +31,7 @@ prior:
 
 # Fixed simulator parameters (not inferred)
 simulator:
-  mode: "equilibrium"            # "equilibrium" (standard smFRET_simulator) or "binding" (h-transform)
+  mode: "equilibrium"            # "equilibrium" (standard smFRET_simulator) or "binding" (two-way shooting from x_TS)
   total_time: 10000.0
   saving_frequency: 10000
   time_step: 5e-5
@@ -45,11 +45,11 @@ simulator:
 
   # Binding mode parameters (only used when mode: "binding")
   binding:
-    n_grid: 500                  # grid points for h-transform precomputation
-    F_guide_max_factor: 0.1      # guiding force clamp (validated: 0.1 is safe)
-    N_max: 200000000             # max integration steps safety cutoff
-    min_steps: 0                 # reject transition paths shorter than this (0 = no minimum)
-    max_bins: 10000              # padded sequence length for variable-length binding traces
+    L_min_bins: 200              # smallest truncated window length, in saved bins
+    L_max_bins: 400              # largest truncated window length and total two-sided shoot length
+    k_persist: 20                # consecutive bins inside a basin to declare commitment
+    landmark_grid_n: 400         # grid size for locating x_A, x_B, x_TS from U(x)
+    N_max: 200000000             # per-leg raw-step safety guard
 
 
 data_generation:

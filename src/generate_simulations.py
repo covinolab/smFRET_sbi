@@ -10,6 +10,7 @@ import torch
 import h5py
 import numpy as np
 from omegaconf import OmegaConf
+from tqdm import tqdm
 import yaml
 
 from simulator import smFRET_simulator_wrapper as fret_simulator
@@ -66,7 +67,7 @@ def _worker_simulate_batch(batch_theta):
 # ── HDF5 writer process ────────────────────────────────────────────────────
 
 def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
-                    in_queue, done_queue, has_lengths=False):
+                    in_queue, done_queue, written_counter, has_lengths=False):
     """Dedicated writer process: drains the queue and appends batches to HDF5."""
     theta_chunks = (max(1, min(chunk_size, num_simulations)), theta_dim)
     x_chunks = (max(1, min(chunk_size, num_simulations)),) + x_shape
@@ -115,9 +116,8 @@ def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
             if has_lengths:
                 f["lengths"][idx : idx + n] = lengths_np
             idx += n
-            print(f"\r  Writing: {idx}/{num_simulations} written", end="", flush=True)
-
-        print()
+            with written_counter.get_lock():
+                written_counter.value = idx
 
         # Trim if some simulations returned None
         if idx < num_simulations:
@@ -193,11 +193,11 @@ def _get_binding_sim_kwargs(cfg):
     binding_cfg = cfg.simulator.get("binding", {})
     return {
         **_get_common_sim_kwargs(cfg),
-        "n_grid": binding_cfg.get("n_grid", 500),
-        "F_guide_max_factor": binding_cfg.get("F_guide_max_factor", 0.1),
-        "N_max": binding_cfg.get("N_max", 200000000),
-        "min_steps": binding_cfg.get("min_steps", 0),
-        "max_bins": binding_cfg.get("max_bins", None),
+        "L_min_bins":      binding_cfg.L_min_bins,
+        "L_max_bins":      binding_cfg.L_max_bins,
+        "k_persist":       binding_cfg.k_persist,
+        "landmark_grid_n": binding_cfg.get("landmark_grid_n", 400),
+        "N_max":           binding_cfg.get("N_max", 200000000),
     }
 
 
@@ -231,7 +231,7 @@ def _prepare_output_dir(output_dir_arg, cfg_output_dir, use_timestamp):
 
 def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
                          sim_kwargs, theta_dim, num_simulations,
-                         has_lengths=False, max_rounds=50):
+                         written_counter, has_lengths=False, max_rounds=50):
     """Run the worker pool, retrying until the simulation budget is met."""
     pool = mp.Pool(
         num_workers,
@@ -241,33 +241,42 @@ def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
     total_simulated = 0
     round_num = 0
 
-    while total_simulated < num_simulations:
-        round_num += 1
-        if round_num > max_rounds:
-            print(f"\n  Warning: reached max retry rounds ({max_rounds}), "
-                  f"stopping with {total_simulated}/{num_simulations} simulations")
-            break
+    sim_bar = tqdm(total=num_simulations, desc="Simulating", position=0,
+                   leave=True, unit="sim")
+    write_bar = tqdm(total=num_simulations, desc="Writing   ", position=1,
+                     leave=True, unit="sim")
 
-        remaining = num_simulations - total_simulated
-        if round_num > 1:
-            print(f"\n  Round {round_num}: sampling {remaining} more to fill "
-                  f"remaining budget...")
+    try:
+        while total_simulated < num_simulations:
+            round_num += 1
+            if round_num > max_rounds:
+                tqdm.write(f"  Warning: reached max retry rounds ({max_rounds}), "
+                           f"stopping with {total_simulated}/{num_simulations} simulations")
+                break
 
-        all_theta = prior.sample((remaining,))
-        batches = [
-            all_theta[i * batch_size : min((i + 1) * batch_size, remaining)]
-            for i in range((remaining + batch_size - 1) // batch_size)
-        ]
+            remaining = num_simulations - total_simulated
+            if round_num > 1:
+                tqdm.write(f"  Round {round_num}: sampling {remaining} more to fill "
+                           f"remaining budget...")
 
-        for count in pool.imap_unordered(_worker_simulate_batch, batches):
-            total_simulated += count
-            print(f"\r  Progress: {total_simulated}/{num_simulations} simulated",
-                  end="", flush=True)
+            all_theta = prior.sample((remaining,))
+            batches = [
+                all_theta[i * batch_size : min((i + 1) * batch_size, remaining)]
+                for i in range((remaining + batch_size - 1) // batch_size)
+            ]
 
-    pool.close()
-    pool.join()
-    print()
-    return total_simulated
+            for count in pool.imap_unordered(_worker_simulate_batch, batches):
+                total_simulated += count
+                sim_bar.n = total_simulated
+                sim_bar.refresh()
+                with written_counter.get_lock():
+                    write_bar.n = written_counter.value
+                write_bar.refresh()
+    finally:
+        pool.close()
+        pool.join()
+
+    return total_simulated, sim_bar, write_bar
 
 
 def _export_pt(h5_path, output_dir):
@@ -318,24 +327,31 @@ def generate_simulations(cfg, args):
     # Start dedicated writer process
     out_queue = mp.Queue()
     done_queue = mp.Queue(maxsize=1)
+    written_counter = mp.Value('i', 0)
     writer = mp.Process(
         target=_writer_process,
         args=(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
-              out_queue, done_queue),
+              out_queue, done_queue, written_counter),
         kwargs=dict(has_lengths=has_lengths),
         daemon=False,
     )
     writer.start()
 
     # Run simulations
-    _run_simulation_pool(
+    _, sim_bar, write_bar = _run_simulation_pool(
         prior, batch_size, num_workers, out_queue, sim_fn, sim_kwargs,
-        theta_dim, num_simulations, has_lengths=has_lengths,
+        theta_dim, num_simulations, written_counter, has_lengths=has_lengths,
     )
 
     # Signal writer to finish
     out_queue.put(None)
     writer.join()
+    # Final drain of the writer counter after the writer has flushed.
+    with written_counter.get_lock():
+        write_bar.n = written_counter.value
+    write_bar.refresh()
+    sim_bar.close()
+    write_bar.close()
     if writer.exitcode != 0:
         raise RuntimeError(f"Writer process failed with exit code {writer.exitcode}")
 

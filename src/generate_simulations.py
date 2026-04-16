@@ -1,5 +1,7 @@
 import argparse
+import logging
 import os
+import queue as _queue
 import shutil
 import multiprocessing as mp
 from pathlib import Path
@@ -13,6 +15,8 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 import yaml
 
+logger = logging.getLogger(__name__)
+
 from simulator import smFRET_simulator_wrapper as fret_simulator
 from simulator import binding_simulator_wrapper as binding_simulator
 from priors import generate_fret_prior_from_config
@@ -24,14 +28,20 @@ _worker_sim_fn = None
 _worker_theta_dim = None
 _worker_out_queue = None
 _worker_has_lengths = False
+_worker_num_traces = 1
+_worker_max_traj_retries = 50
 
 
-def _init_worker(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths):
+def _init_worker(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths,
+                 num_traces=1, max_traj_retries=1):
     """Initialise per-worker shared state (called once per pool worker)."""
-    global _worker_sim_fn, _worker_theta_dim, _worker_out_queue, _worker_has_lengths
+    global _worker_sim_fn, _worker_theta_dim, _worker_out_queue
+    global _worker_has_lengths, _worker_num_traces, _worker_max_traj_retries
     _worker_theta_dim = theta_dim
     _worker_out_queue = out_queue
     _worker_has_lengths = has_lengths
+    _worker_num_traces = num_traces
+    _worker_max_traj_retries = max_traj_retries
     _worker_sim_fn = partial(sim_fn, **sim_kwargs)
     np.random.seed(os.getpid() % (2**32))
     torch.set_num_threads(1)
@@ -40,17 +50,37 @@ def _init_worker(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths):
 def _worker_simulate_batch(batch_theta):
     """Simulate a batch, push results to the writer queue, return success count."""
     results_theta, results_x, results_lengths = [], [], []
+    N = _worker_num_traces
 
     for i in range(len(batch_theta)):
-        result = _worker_sim_fn(batch_theta[i])
-        if result is None:
+        traces, lengths = [], []
+        ok = True
+        for _ in range(N):
+            result = None
+            for _attempt in range(_worker_max_traj_retries):
+                result = _worker_sim_fn(batch_theta[i])
+                if result is not None:
+                    break
+            if result is None:
+                ok = False
+                break
+            if _worker_has_lengths:
+                trace, length = result
+                traces.append(trace)
+                lengths.append(length)
+            else:
+                traces.append(result)
+        if not ok:
             continue
-        if _worker_has_lengths:
-            trace, length = result
-            results_x.append(trace)
-            results_lengths.append(length)
+
+        if N > 1:
+            results_x.append(np.stack(traces, axis=0))
+            if _worker_has_lengths:
+                results_lengths.append(np.array(lengths, dtype=np.int32))
         else:
-            results_x.append(result)
+            results_x.append(traces[0])
+            if _worker_has_lengths:
+                results_lengths.append(lengths[0])
         results_theta.append(batch_theta[i][:_worker_theta_dim].numpy())
 
     if not results_theta:
@@ -58,16 +88,23 @@ def _worker_simulate_batch(batch_theta):
 
     thetas, xs = np.stack(results_theta), np.stack(results_x)
     if _worker_has_lengths:
-        _worker_out_queue.put((thetas, xs, np.array(results_lengths, dtype=np.int32)))
+        payload = (thetas, xs, np.array(results_lengths, dtype=np.int32))
     else:
-        _worker_out_queue.put((thetas, xs))
+        payload = (thetas, xs)
+    while True:
+        try:
+            _worker_out_queue.put(payload, timeout=30)
+            break
+        except _queue.Full:
+            continue
     return len(results_theta)
 
 
 # ── HDF5 writer process ────────────────────────────────────────────────────
 
 def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
-                    in_queue, done_queue, written_counter, has_lengths=False):
+                    in_queue, done_queue, written_counter, has_lengths=False,
+                    lengths_shape=()):
     """Dedicated writer process: drains the queue and appends batches to HDF5."""
     theta_chunks = (max(1, min(chunk_size, num_simulations)), theta_dim)
     x_chunks = (max(1, min(chunk_size, num_simulations)),) + x_shape
@@ -91,12 +128,14 @@ def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
             compression="gzip", compression_opts=1, shuffle=True,
         )
         if has_lengths:
+            full_lengths_shape = (num_simulations,) + lengths_shape
+            lengths_chunks = (max(1, min(chunk_size, num_simulations)),) + lengths_shape
             f.create_dataset(
                 "lengths",
-                shape=(num_simulations,),
-                maxshape=(num_simulations,),
+                shape=full_lengths_shape,
+                maxshape=full_lengths_shape,
                 dtype="int32",
-                chunks=(max(1, min(chunk_size, num_simulations)),),
+                chunks=lengths_chunks,
                 compression="gzip", compression_opts=1,
             )
 
@@ -157,54 +196,15 @@ def parse_args():
                         help="Add timestamp to output directory name")
     parser.add_argument("--chunk-size", type=int, default=None,
                         help="HDF5 chunk size (defaults to batch_size)")
-    parser.add_argument("--format", "-f", type=str, choices=["pt", "h5", "both"],
-                        default="h5", help="Output format: 'h5', 'pt', or 'both'")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
     return parser.parse_args()
-
-
-# ── Configuration helpers ───────────────────────────────────────────────────
-
-def _get_common_sim_kwargs(cfg):
-    """Extract simulator kwargs shared between equilibrium and binding modes."""
-    return dict(
-        dt=cfg.simulator.time_step,
-        saving_freq=cfg.simulator.saving_frequency,
-        x_min=cfg.simulator.x_min,
-        x_max=cfg.simulator.x_max,
-        num_knots=cfg.prior.num_knots,
-        max_force=cfg.simulator.max_force,
-        boundary_condition=cfg.simulator.boundary_condition,
-        spline_type=cfg.simulator.spline_type,
-        num_boundary_knots=cfg.simulator.num_boundary_knots,
-    )
-
-
-def _get_sim_kwargs(cfg):
-    """Build kwargs for the equilibrium simulator."""
-    return {
-        **_get_common_sim_kwargs(cfg),
-        "T": cfg.simulator.total_time,
-        "x_init": tuple(cfg.simulator.x_init),
-    }
-
-
-def _get_binding_sim_kwargs(cfg):
-    """Build kwargs for the binding simulator."""
-    binding_cfg = cfg.simulator.get("binding", {})
-    return {
-        **_get_common_sim_kwargs(cfg),
-        "L_min_bins":      binding_cfg.L_min_bins,
-        "L_max_bins":      binding_cfg.L_max_bins,
-        "k_persist":       binding_cfg.k_persist,
-        "landmark_grid_n": binding_cfg.get("landmark_grid_n", 400),
-        "N_max":           binding_cfg.get("N_max", 200000000),
-    }
 
 
 # ── Simulation orchestration ───────────────────────────────────────────────
 
 def _determine_output_shape(sim_fn, sim_kwargs, prior, has_lengths=False,
-                            max_attempts=100):
+                            num_traces_per_set=1, max_attempts=100):
     """Run test simulations to discover the observation tensor shape."""
     fn = partial(sim_fn, **sim_kwargs)
     for _ in range(max_attempts):
@@ -213,8 +213,12 @@ def _determine_output_shape(sim_fn, sim_kwargs, prior, has_lengths=False,
         if result is not None:
             if has_lengths:
                 trace, _ = result
-                return tuple(trace.shape)
-            return tuple(result.shape)
+                single_shape = tuple(trace.shape)
+            else:
+                single_shape = tuple(result.shape)
+            if num_traces_per_set > 1:
+                return (num_traces_per_set,) + single_shape
+            return single_shape
     raise RuntimeError(
         f"Could not determine output shape after {max_attempts} test simulations"
     )
@@ -231,12 +235,16 @@ def _prepare_output_dir(output_dir_arg, cfg_output_dir, use_timestamp):
 
 def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
                          sim_kwargs, theta_dim, num_simulations,
-                         written_counter, has_lengths=False, max_rounds=50):
+                         written_counter, writer_process=None,
+                         has_lengths=False,
+                         num_traces_per_set=1, max_traj_retries=1,
+                         max_rounds=500):
     """Run the worker pool, retrying until the simulation budget is met."""
     pool = mp.Pool(
         num_workers,
         initializer=_init_worker,
-        initargs=(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths),
+        initargs=(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths,
+                  num_traces_per_set, max_traj_retries),
     )
     total_simulated = 0
     round_num = 0
@@ -250,14 +258,15 @@ def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
         while total_simulated < num_simulations:
             round_num += 1
             if round_num > max_rounds:
-                tqdm.write(f"  Warning: reached max retry rounds ({max_rounds}), "
-                           f"stopping with {total_simulated}/{num_simulations} simulations")
+                logger.warning("Reached max retry rounds (%d), stopping with "
+                               "%d/%d simulations", max_rounds,
+                               total_simulated, num_simulations)
                 break
 
             remaining = num_simulations - total_simulated
             if round_num > 1:
-                tqdm.write(f"  Round {round_num}: sampling {remaining} more to fill "
-                           f"remaining budget...")
+                logger.debug("Round %d: sampling %d more to fill remaining "
+                             "budget...", round_num, remaining)
 
             all_theta = prior.sample((remaining,))
             batches = [
@@ -272,19 +281,18 @@ def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
                 with written_counter.get_lock():
                     write_bar.n = written_counter.value
                 write_bar.refresh()
+                if writer_process is not None and not writer_process.is_alive():
+                    pool.terminate()
+                    pool.join()
+                    raise RuntimeError(
+                        f"Writer process died (exit code {writer_process.exitcode}). "
+                        f"Simulated {total_simulated}/{num_simulations} before failure."
+                    )
     finally:
         pool.close()
         pool.join()
 
     return total_simulated, sim_bar, write_bar
-
-
-def _export_pt(h5_path, output_dir):
-    """Export theta and x datasets from HDF5 as PyTorch .pt files."""
-    with h5py.File(h5_path, "r") as f:
-        torch.save(torch.from_numpy(f["theta"][:]), output_dir / "theta.pt")
-        torch.save(torch.from_numpy(f["x"][:]), output_dir / "x.pt")
-    print("  Saved theta.pt and x.pt")
 
 
 def generate_simulations(cfg, args):
@@ -293,26 +301,59 @@ def generate_simulations(cfg, args):
     Returns (h5_path, actual_count, output_dir).
     """
     num_simulations = args.num_simulations or cfg.data_generation.num_simulations
-    num_workers = args.num_workers or cfg.data_generation.num_workers
+    num_workers = args.num_workers
     batch_size = cfg.data_generation.batch_size
     chunk_size = args.chunk_size or cfg.data_generation.chunk_size
-    theta_dim = cfg.prior.num_knots + 1
+    theta_dim = cfg.prior.num_knots + 2
+
+    num_traces_per_set = int(cfg.data_generation.get("num_traces_per_set", 1))
+    max_traj_retries = int(cfg.data_generation.get("max_traj_retries", 1))
 
     prior = generate_fret_prior_from_config(cfg, device="cpu")
 
-    # Mode dispatch
+    # Mode dispatch — build sim_fn and sim_kwargs
     mode = str(cfg.simulator.get("mode", "equilibrium")).lower()
     has_lengths = (mode == "binding")
+    sim_kwargs = dict(
+        dt=cfg.simulator.time_step,
+        saving_freq=cfg.simulator.saving_frequency,
+        x_min=cfg.simulator.x_min,
+        x_max=cfg.simulator.x_max,
+        num_knots=cfg.prior.num_knots,
+        max_force=cfg.simulator.max_force,
+        boundary_condition=cfg.simulator.boundary_condition,
+        spline_type=cfg.simulator.spline_type,
+        num_boundary_knots=cfg.simulator.num_boundary_knots,
+    )
     if mode == "binding":
-        sim_fn, sim_kwargs = binding_simulator, _get_binding_sim_kwargs(cfg)
+        binding_cfg = cfg.simulator.binding
+        sim_kwargs.update(
+            L_min_bins=binding_cfg.L_min_bins,
+            L_max_bins=binding_cfg.L_max_bins,
+            k_persist=binding_cfg.k_persist,
+            landmark_grid_n=binding_cfg.get("landmark_grid_n", 400),
+            N_max=binding_cfg.get("N_max", 200000000),
+        )
+        sim_fn = binding_simulator
         print("Mode: binding (h-transform, variable-length traces)")
     else:
-        sim_fn, sim_kwargs = fret_simulator, _get_sim_kwargs(cfg)
+        sim_kwargs.update(
+            T=cfg.simulator.total_time,
+            x_init=tuple(cfg.simulator.x_init),
+        )
+        sim_fn = fret_simulator
         print("Mode: equilibrium (fixed-length traces)")
+
+    if num_traces_per_set > 1:
+        print(f"Set-based mode: {num_traces_per_set} iid traces per parameter set")
+    if max_traj_retries > 1:
+        print(f"Per-trajectory retries: {max_traj_retries}")
 
     # Discover observation shape
     print("Running test simulation to determine output shape...")
-    x_shape = _determine_output_shape(sim_fn, sim_kwargs, prior, has_lengths=has_lengths)
+    x_shape = _determine_output_shape(sim_fn, sim_kwargs, prior,
+                                      has_lengths=has_lengths,
+                                      num_traces_per_set=num_traces_per_set)
     print(f"  theta dim: {theta_dim}, observation shape: {x_shape}")
 
     # Prepare output
@@ -325,14 +366,15 @@ def generate_simulations(cfg, args):
     print(f"  x_shape={x_shape}, per-batch result size ~{batch_x_mb:.1f} MB", flush=True)
 
     # Start dedicated writer process
-    out_queue = mp.Queue()
+    out_queue = mp.Queue(maxsize=2 * num_workers)
     done_queue = mp.Queue(maxsize=1)
     written_counter = mp.Value('i', 0)
+    lengths_shape = (num_traces_per_set,) if (has_lengths and num_traces_per_set > 1) else ()
     writer = mp.Process(
         target=_writer_process,
         args=(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
               out_queue, done_queue, written_counter),
-        kwargs=dict(has_lengths=has_lengths),
+        kwargs=dict(has_lengths=has_lengths, lengths_shape=lengths_shape),
         daemon=False,
     )
     writer.start()
@@ -340,7 +382,10 @@ def generate_simulations(cfg, args):
     # Run simulations
     _, sim_bar, write_bar = _run_simulation_pool(
         prior, batch_size, num_workers, out_queue, sim_fn, sim_kwargs,
-        theta_dim, num_simulations, written_counter, has_lengths=has_lengths,
+        theta_dim, num_simulations, written_counter, writer_process=writer,
+        has_lengths=has_lengths,
+        num_traces_per_set=num_traces_per_set,
+        max_traj_retries=max_traj_retries,
     )
 
     # Signal writer to finish
@@ -361,13 +406,6 @@ def generate_simulations(cfg, args):
               f"trimmed to {actual_count}")
     print(f"  HDF5 file written: {h5_path}  ({actual_count} simulations, gzip level 1)")
 
-    # Optionally export .pt copies
-    if args.format in ("pt", "both"):
-        _export_pt(h5_path, output_dir)
-    if args.format == "pt":
-        Path(h5_path).unlink()
-        h5_path = None
-
     return h5_path, actual_count, output_dir
 
 
@@ -379,13 +417,11 @@ def save_metadata(output_dir, cfg, config_path, args, actual_count, h5_path):
         "generated_at": datetime.now().isoformat(),
         "num_simulations": actual_count,
         "source_config": str(Path(config_path).resolve()),
-        "output_file": str(h5_path) if h5_path else None,
-        "format": args.format,
+        "output_file": str(h5_path),
         "command_line_overrides": {
             "num_simulations": args.num_simulations,
             "num_workers": args.num_workers,
             "output_dir": args.output_dir,
-            "format": args.format,
         },
     }
     with open(output_dir / "metadata.yaml", "w") as f:
@@ -399,6 +435,10 @@ def save_metadata(output_dir, cfg, config_path, args, actual_count, h5_path):
 
 def main():
     args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
 
     config_path = Path(args.config)
     if not config_path.exists():

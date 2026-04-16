@@ -482,3 +482,38 @@ def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
     raise ValueError(
         f"Unknown embedding.name='{encoder_name}'. Use one of: cnn, transformer."
     )
+
+
+class SetEmbedding(nn.Module):
+    """Permutation-invariant embedding for sets of temporal traces.
+
+    Applies a per-trace encoder independently, then sum-pools across the set.
+    """
+
+    def __init__(self, single_trace_encoder, post_agg_hidden=None, output_dim=None):
+        super().__init__()
+        self.encoder = single_trace_encoder
+        if post_agg_hidden and output_dim:
+            encoder_out = output_dim
+            self.post_agg = nn.Sequential(
+                nn.Linear(encoder_out, post_agg_hidden),
+                nn.GELU(),
+                nn.Linear(post_agg_hidden, output_dim),
+            )
+        else:
+            self.post_agg = nn.Identity()
+
+    def forward(self, x):
+        B, N, T, C = x.shape
+        x = x.reshape(B * N, T, C)
+        x = self.encoder(x)
+        x = x.reshape(B, N, -1)
+        x = x.sum(dim=1)
+        return self.post_agg(x)
+
+
+def build_set_embedding(cfg_embedding, transition_dim, max_len,
+                        post_agg_hidden=None):
+    encoder = build_temporal_encoder(cfg_embedding, transition_dim, max_len)
+    output_dim = int(getattr(cfg_embedding, "output_dim", 128))
+    return SetEmbedding(encoder, post_agg_hidden, output_dim)

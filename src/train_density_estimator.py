@@ -19,7 +19,7 @@ from sbi.neural_nets import posterior_nn
 
 from data_loaders import H5Dataset
 import os
-from temporal_encoders import build_temporal_encoder
+from temporal_encoders import build_temporal_encoder, build_set_embedding
 from utils import (
     assert_equal_train_steps as _assert_equal_train_steps,
     cleanup_ddp,
@@ -43,7 +43,17 @@ log = logging.getLogger(__name__)
 
 
 def _augment_with_mask(x, lengths):
-    """Append binary mask channel: 1=valid, 0=padded. x: [batch, T, 2] -> [batch, T, 3]"""
+    """Append binary mask channel: 1=valid, 0=padded.
+
+    Handles both single-trace [batch, T, 2] and set-based [batch, N, T, 2] inputs.
+    """
+    if x.ndim == 4:
+        B, N, T, C = x.shape
+        x_flat = x.reshape(B * N, T, C)
+        lengths_flat = lengths.reshape(B * N)
+        mask = torch.arange(T, device=x.device).unsqueeze(0) < lengths_flat.unsqueeze(1)
+        x_flat = torch.cat([x_flat, mask.unsqueeze(-1).float()], dim=-1)
+        return x_flat.reshape(B, N, T, C + 1)
     mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
     return torch.cat([x, mask.unsqueeze(-1).float()], dim=-1)
 
@@ -184,16 +194,32 @@ def train(cfg: DictConfig) -> float:
         theta_init, x_init = temp_dataset[:100]
         transition_dim = 2
 
-    max_len = x_init.shape[1]
+    num_traces_per_set = int(getattr(cfg.data, "num_traces_per_set", 1))
+
+    if num_traces_per_set > 1:
+        max_len = x_init.shape[2]
+    else:
+        max_len = x_init.shape[1]
     probe_x = x_init[: min(8, x_init.shape[0])].clone()
     del temp_dataset
 
     # Build embedding network (CNN / Transformer / LRU)
-    encoder = build_temporal_encoder(
-        cfg_embedding=cfg.embedding,
-        transition_dim=transition_dim,
-        max_len=max_len
-    )
+    if num_traces_per_set > 1:
+        post_agg_hidden = int(getattr(cfg.embedding, "post_agg_hidden", 0)) or None
+        encoder = build_set_embedding(
+            cfg_embedding=cfg.embedding,
+            transition_dim=transition_dim,
+            max_len=max_len,
+            post_agg_hidden=post_agg_hidden,
+        )
+        log.info(f"Set-based mode: {num_traces_per_set} traces per set, "
+                 f"post_agg_hidden={post_agg_hidden}")
+    else:
+        encoder = build_temporal_encoder(
+            cfg_embedding=cfg.embedding,
+            transition_dim=transition_dim,
+            max_len=max_len
+        )
 
     # Build normalizing flow
     neural_posterior = posterior_nn(

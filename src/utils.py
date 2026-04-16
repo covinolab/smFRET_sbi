@@ -1,7 +1,9 @@
 import logging
+import math
 import os
 import random
 import subprocess
+import types
 from functools import partial
 from pathlib import Path
 from typing import Optional
@@ -10,6 +12,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
+from sbi.inference.posteriors import MCMCPosterior
+from sbi.inference.potentials import ratio_estimator_based_potential
+from sbi.utils.sbiutils import mcmc_transform
 
 from gsl_spline import eval_spline, integrate_spline
 
@@ -371,4 +376,121 @@ def eval_force_from_config(cfg):
         max_force=cfg.simulator.max_force,
         spline_type=cfg.simulator.spline_type,
         num_boundary_knots=cfg.simulator.num_boundary_knots,
+    )
+
+
+def _install_cached_x_embedding(ratio_estimator, observation, device):
+    """Pre-embed x_o once and monkeypatch combine_theta_and_x to reuse it."""
+    with torch.no_grad():
+        x_o_embedded = ratio_estimator.embedding_net_x(
+            observation.to(device).reshape(-1, *ratio_estimator.x_shape)
+        )
+    ratio_estimator._x_cached_embedded = x_o_embedded
+
+    _original_combine = ratio_estimator.__class__.combine_theta_and_x
+
+    def _fast_combine(self, theta, x):
+        theta_shape_size = math.prod(self.theta_shape)
+        n_iid = self._x_cached_embedded.shape[0]
+
+        if theta.numel() % theta_shape_size != 0:
+            return _original_combine(self, theta, x)
+
+        n = theta.numel() // theta_shape_size
+        if n % n_iid != 0:
+            return _original_combine(self, theta, x)
+
+        embedded_theta = self.embedding_net_theta(theta.reshape(n, *self.theta_shape))
+        embedded_x = self._x_cached_embedded.repeat_interleave(n // n_iid, dim=0)
+        prefix_shape = theta.shape[: -len(self.theta_shape)]
+        return torch.cat([embedded_theta, embedded_x], dim=-1).reshape(*prefix_shape, -1)
+
+    ratio_estimator.combine_theta_and_x = types.MethodType(_fast_combine, ratio_estimator)
+
+
+def _build_cached_ratio_potentials(ratio_estimators, prior, observation, device):
+    """Move each estimator to ``device``, install cached x embeddings, and build
+    per-member ``RatioBasedPotential``s. Returns ``(potentials, theta_transform)``.
+    The ``theta_transform`` is constructed explicitly on ``device`` to avoid
+    device mismatches when a pickled estimator was saved on CPU.
+    """
+
+    observation_dev = observation.to(device)
+    potentials = []
+    for re in ratio_estimators:
+        re.to(device)
+        _install_cached_x_embedding(re, observation_dev, device)
+        potential, _ = ratio_estimator_based_potential(re, prior, observation_dev)
+        potentials.append(potential)
+
+    theta_transform = mcmc_transform(prior, device=device)
+    return potentials, theta_transform
+
+
+def build_cached_posterior(
+    ratio_estimator,
+    prior,
+    observation,
+    num_chains=50,
+    thin=2,
+    device="cuda",
+):
+    """MCMCPosterior backed by a single ratio estimator with cached x embedding."""
+    return build_cached_ensembled_posterior(
+        [ratio_estimator],
+        prior,
+        observation,
+        num_chains=num_chains,
+        thin=thin,
+        device=device,
+    )
+
+
+def build_cached_ensembled_posterior(
+    ratio_estimators,
+    prior,
+    observation,
+    num_chains=50,
+    thin=2,
+    weights=None,
+    device="cuda",
+):
+    """Product-of-experts MCMCPosterior over a list of cached ratio estimators.
+
+    Each per-member ``RatioBasedPotential`` already adds ``prior.log_prob(theta)``,
+    so the weighted sum subtracts ``(sum(weights) - 1) * log_prior`` to keep the
+    prior contribution at exactly one.
+    """
+
+    if len(ratio_estimators) == 0:
+        raise ValueError("ratio_estimators must be non-empty.")
+    if weights is None:
+        weights = [1.0] * len(ratio_estimators)
+    if len(weights) != len(ratio_estimators):
+        raise ValueError("weights must match ratio_estimators in length.")
+
+    potentials, theta_transform = _build_cached_ratio_potentials(
+        ratio_estimators, prior, observation, device
+    )
+    prior_correction = float(sum(weights)) - 1.0
+
+    def ensemble_potential(theta, x_o=None, track_gradients=True):
+        # x_o is ignored: each member holds its own cached x embedding.
+        weighted_terms = [
+            w * p(theta, track_gradients=track_gradients)
+            for w, p in zip(weights, potentials)
+        ]
+        log_post = torch.stack(weighted_terms, dim=0).sum(dim=0)
+        if prior_correction != 0.0:
+            log_post = log_post - prior_correction * prior.log_prob(theta)
+        return log_post
+
+    return MCMCPosterior(
+        ensemble_potential,
+        proposal=prior,
+        theta_transform=theta_transform,
+        num_chains=num_chains,
+        thin=thin,
+        method="slice_np_vectorized",
+        device=device,
     )

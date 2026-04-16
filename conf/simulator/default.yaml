@@ -56,6 +56,7 @@ data_generation:
   num_simulations: 200000       # number of simulations to generate
   batch_size: 100              # simulations per batch
   chunk_size: 128              # HDF5 chunk size (samples per chunk)
+  num_traces_per_set: 1        # iid traces per parameter set (1 = single-trace mode)
 
 output:
   directory: ./data/base            # output directory for training data

@@ -5,6 +5,23 @@ from utils import make_spline_knots
 from smFRET_simulator import smFRET_simulator, binding_simulator
 from omegaconf import OmegaConf
 
+
+def _unpack_physics_params(params, num_knots):
+    """Unpack the physics parameters shared by both simulator wrappers."""
+    return dict(
+        R0=params[num_knots + 1],
+        kD=params[num_knots + 2],
+        k_gb=params[num_knots + 3],
+        k_rb=params[num_knots + 4],
+        eta_g=params[num_knots + 5],
+        eta_r=params[num_knots + 6],
+        C_gg=params[num_knots + 7],
+        C_rr=params[num_knots + 8],
+        C_gr=params[num_knots + 9],
+        C_rg=params[num_knots + 10],
+    )
+
+
 def smFRET_simulator_wrapper(
                 params, 
                 dt=5e-4, 
@@ -28,30 +45,21 @@ def smFRET_simulator_wrapper(
             x_max=x_max,
             num_knots=num_knots,
             max_force=max_force,
-            boundary_condition=boundary_condition,  
+            boundary_condition=boundary_condition,
             num_boundary_knots=num_boundary_knots
         )
 
+        phys = _unpack_physics_params(params, num_knots)
         kG_photons, kR_photons = smFRET_simulator(
                 x0=x_init,
                 Dx=10**params[0],
                 x_knots=x_knots,
                 y_knots=y_knots,
-                R0=params[num_knots+1],
-                kD=params[num_knots+2],
-                k_gb=params[num_knots+3],
-                k_rb=params[num_knots+4],
-                eta_g=params[num_knots+5],
-                eta_r=params[num_knots+6],
-                C_gg=params[num_knots+7],
-                C_rr=params[num_knots+8],
-                C_gr=params[num_knots+9],
-                C_rg=params[num_knots+10],
+                **phys,
                 T=T,
                 saving_freq=saving_freq,
                 dt=dt,
-                spline_type=spline_type
-
+                spline_type=spline_type,
         )
         if kG_photons is None or kR_photons is None:
             return None
@@ -136,22 +144,12 @@ def binding_simulator_wrapper(
             num_boundary_knots=num_boundary_knots
         )
 
-        Dx = 10 ** params[0]
-
+        phys = _unpack_physics_params(params, num_knots)
         kG_photons, kR_photons = binding_simulator(
-                Dx=Dx,
+                Dx=10 ** params[0],
                 x_knots=x_knots,
                 y_knots=y_knots,
-                R0=params[num_knots+1],
-                kD=params[num_knots+2],
-                k_gb=params[num_knots+3],
-                k_rb=params[num_knots+4],
-                eta_g=params[num_knots+5],
-                eta_r=params[num_knots+6],
-                C_gg=params[num_knots+7],
-                C_rr=params[num_knots+8],
-                C_gr=params[num_knots+9],
-                C_rg=params[num_knots+10],
+                **phys,
                 saving_freq=saving_freq,
                 dt=dt,
                 x_min=x_min,
@@ -161,7 +159,7 @@ def binding_simulator_wrapper(
                 k_persist=k_persist,
                 landmark_grid_n=landmark_grid_n,
                 N_max=N_max,
-                spline_type=spline_type
+                spline_type=spline_type,
         )
         if kG_photons is None or kR_photons is None:
             return None

@@ -122,9 +122,10 @@ def generate_fret_prior_from_config(cfg, device: str = "cpu") -> MultipleIndepen
 
 def generate_posterior_prior_from_config(cfg, device: str = "cpu") -> MultipleIndependent:
     """
-    Reduced prior (logD + gradient knots only) for posterior sampling.
+    Reduced prior (logD + gradient knots + R0) for posterior sampling.
 
-    Returns MultipleIndependent([prior_logD, prior_spline]).
+    Returns MultipleIndependent([prior_logD, *prior_spline, prior_R0]).
+    Parameter order: [logD, g₀…gₙ₋₁, R0]. Total length: num_knots + 2.
     """
     cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
 
@@ -139,4 +140,9 @@ def generate_posterior_prior_from_config(cfg, device: str = "cpu") -> MultipleIn
 
     prior_spline = generate_spline_prior(centers=center, scale=scale, num_knots=num_knots, device=device)
 
-    return MultipleIndependent([prior_logD, *prior_spline], device=device)
+    prior_R0 = dists.Uniform(
+        torch.tensor([cfg.prior.R0_lims[0]], device=device),
+        torch.tensor([cfg.prior.R0_lims[1]], device=device),
+    )
+
+    return MultipleIndependent([prior_logD, *prior_spline, prior_R0], device=device)

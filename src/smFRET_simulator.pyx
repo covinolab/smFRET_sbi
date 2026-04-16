@@ -511,7 +511,7 @@ def binding_simulator(
     cdef int leg_len_bwd = 0
     cdef int basin_fwd = -1
     cdef int basin_bwd = -1
-    cdef int max_shoot_attempts = 10
+    cdef int max_shoot_attempts = 100
     cdef int attempt
     cdef int accepted = 0
 

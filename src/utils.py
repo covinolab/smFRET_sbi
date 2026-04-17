@@ -14,7 +14,9 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from sbi.inference.posteriors import MCMCPosterior
 from sbi.inference.potentials import ratio_estimator_based_potential
-from sbi.utils.sbiutils import mcmc_transform
+from sbi.utils import within_support
+from sbi.utils.sbiutils import gradient_ascent, mcmc_transform
+from torch import nn
 
 from gsl_spline import eval_spline, integrate_spline
 
@@ -494,3 +496,76 @@ def build_cached_ensembled_posterior(
         method="slice_np_vectorized",
         device=device,
     )
+
+
+def map_with_cached_embedding(
+    density_estimator,
+    prior,
+    x,
+    num_iter: int,
+    num_init_samples: int,
+    num_to_optimize: int,
+    learning_rate: float,
+    init_samples: Optional[torch.Tensor] = None,
+    show_progress_bars: bool = False,
+):
+    """MAP estimator for an NPE density estimator that embeds ``x`` exactly once.
+
+    Equivalent to ``DirectPosterior.map()`` but hoists the (expensive)
+    embedding-net forward pass out of the gradient loop: the embedding runs
+    once up front, then the inner log_prob path is fed the cached embedded
+    context on every gradient step. For ``maf_rqs`` (NFlowsFlow) the
+    embedding net lives at ``density_estimator.net._embedding_net``; for
+    ZukoFlow it lives at ``density_estimator._embedding_net``. Both are
+    temporarily swapped to ``nn.Identity`` inside a try/finally so that the
+    wrapped ``log_prob(theta, condition=emb_x)`` becomes a no-op embedding
+    plus the usual flow transform + base distribution log prob.
+    """
+    device = next(density_estimator.parameters()).device
+    density_estimator.eval()
+    x = x.to(device)
+
+    with torch.no_grad():
+        emb_x = density_estimator.embedding_net(x).detach()
+
+    if hasattr(density_estimator.net, "_embedding_net"):
+        embed_holder, embed_attr = density_estimator.net, "_embedding_net"
+    else:
+        embed_holder, embed_attr = density_estimator, "_embedding_net"
+    original = getattr(embed_holder, embed_attr)
+    setattr(embed_holder, embed_attr, nn.Identity())
+
+    try:
+        def potential_fn(theta):
+            theta_ = theta.to(device)
+            if theta_.dim() == 1:
+                theta_ = theta_.unsqueeze(0)
+            theta_batched = theta_.unsqueeze(1)
+            log_p = density_estimator.log_prob(theta_batched, condition=emb_x)
+            log_p = log_p.squeeze(1)
+            in_support = within_support(prior, theta_)
+            return torch.where(
+                in_support,
+                log_p,
+                torch.tensor(-float("inf"), device=log_p.device, dtype=log_p.dtype),
+            )
+
+        if init_samples is None:
+            init_samples = prior.sample((num_init_samples,))
+        init_samples = init_samples.to(device).detach()
+
+        theta_transform = mcmc_transform(prior, device=str(device))
+
+        argmax_, max_val = gradient_ascent(
+            potential_fn=potential_fn,
+            inits=init_samples,
+            theta_transform=theta_transform,
+            num_iter=num_iter,
+            num_to_optimize=num_to_optimize,
+            learning_rate=learning_rate,
+            show_progress_bars=show_progress_bars,
+        )
+    finally:
+        setattr(embed_holder, embed_attr, original)
+
+    return argmax_.detach().cpu().squeeze(0), float(max_val.detach().cpu().item())

@@ -93,10 +93,15 @@ def find_shards(input_dir: Path, pattern: str) -> list[Path]:
     return sorted(files, key=natural_sort_key)
 
 
-def inspect_shards(files: list[Path]) -> tuple[list[ShardInfo], DatasetLayout, DatasetLayout]:
+def inspect_shards(
+    files: list[Path],
+) -> tuple[list[ShardInfo], DatasetLayout, DatasetLayout, DatasetLayout | None]:
     shard_infos: list[ShardInfo] = []
     theta_layout: DatasetLayout | None = None
     x_layout: DatasetLayout | None = None
+    lengths_layout: DatasetLayout | None = None
+    lengths_reference_path: Path | None = None
+    first_path: Path | None = None
 
     for path in files:
         with h5py.File(path, "r") as f:
@@ -105,6 +110,7 @@ def inspect_shards(files: list[Path]) -> tuple[list[ShardInfo], DatasetLayout, D
 
             theta = f["theta"]
             x = f["x"]
+            lengths = f["lengths"] if "lengths" in f else None
 
             if theta.ndim != 2:
                 raise ValueError(f"{path} theta dataset must be 2D, got shape {theta.shape}")
@@ -112,13 +118,23 @@ def inspect_shards(files: list[Path]) -> tuple[list[ShardInfo], DatasetLayout, D
                 raise ValueError(f"{path} x dataset must have sample axis plus feature dims, got {x.shape}")
             if len(theta) != len(x):
                 raise ValueError(f"{path} has mismatched theta/x lengths: {len(theta)} vs {len(x)}")
+            if lengths is not None and len(lengths) != len(theta):
+                raise ValueError(
+                    f"{path} has mismatched theta/lengths lengths: {len(theta)} vs {len(lengths)}"
+                )
 
             current_theta_layout = DatasetLayout.from_dataset(theta)
             current_x_layout = DatasetLayout.from_dataset(x)
+            current_lengths_layout = (
+                DatasetLayout.from_dataset(lengths) if lengths is not None else None
+            )
 
             if theta_layout is None:
                 theta_layout = current_theta_layout
                 x_layout = current_x_layout
+                lengths_layout = current_lengths_layout
+                lengths_reference_path = path if lengths is not None else None
+                first_path = path
             else:
                 if current_theta_layout.tail_shape != theta_layout.tail_shape:
                     raise ValueError(
@@ -139,12 +155,31 @@ def inspect_shards(files: list[Path]) -> tuple[list[ShardInfo], DatasetLayout, D
                     raise ValueError(
                         f"X dtype mismatch in {path}: {current_x_layout.dtype} vs {x_layout.dtype}"
                     )
+                if (current_lengths_layout is None) != (lengths_layout is None):
+                    has_path = lengths_reference_path if lengths_layout is not None else first_path
+                    missing_path = path if current_lengths_layout is None else has_path
+                    present_path = path if current_lengths_layout is not None else has_path
+                    raise ValueError(
+                        f"Cannot mix binding and equilibrium shards: {present_path} has a "
+                        f"'lengths' dataset but {missing_path} does not."
+                    )
+                if current_lengths_layout is not None and lengths_layout is not None:
+                    if current_lengths_layout.tail_shape != lengths_layout.tail_shape:
+                        raise ValueError(
+                            f"Lengths shape mismatch in {path}: {current_lengths_layout.tail_shape} "
+                            f"vs {lengths_layout.tail_shape}"
+                        )
+                    if current_lengths_layout.dtype != lengths_layout.dtype:
+                        raise ValueError(
+                            f"Lengths dtype mismatch in {path}: {current_lengths_layout.dtype} "
+                            f"vs {lengths_layout.dtype}"
+                        )
 
             shard_infos.append(ShardInfo(path=path, num_samples=len(theta)))
 
     assert theta_layout is not None
     assert x_layout is not None
-    return shard_infos, theta_layout, x_layout
+    return shard_infos, theta_layout, x_layout, lengths_layout
 
 
 def validate_configs(shard_infos: list[ShardInfo]) -> None:
@@ -236,6 +271,7 @@ def merge_shards(
     output_path: Path,
     theta_layout: DatasetLayout,
     x_layout: DatasetLayout,
+    lengths_layout: DatasetLayout | None,
     compression_override: int | None,
 ) -> int:
     n_total = total_samples(shard_infos)
@@ -254,6 +290,14 @@ def merge_shards(
             maxshape=(n_total,) + x_layout.tail_shape,
             **create_dataset_kwargs(x_layout, n_total, compression_override),
         )
+        lengths_ds = None
+        if lengths_layout is not None:
+            lengths_ds = out.create_dataset(
+                "lengths",
+                shape=(n_total,) + lengths_layout.tail_shape,
+                maxshape=(n_total,) + lengths_layout.tail_shape,
+                **create_dataset_kwargs(lengths_layout, n_total, compression_override),
+            )
 
         offset = 0
         with tqdm(total=len(shard_infos), unit="shard", desc="Merging shards") as pbar:
@@ -262,6 +306,8 @@ def merge_shards(
                     next_offset = offset + shard.num_samples
                     theta_ds[offset:next_offset] = src["theta"][:]
                     x_ds[offset:next_offset] = src["x"][:]
+                    if lengths_ds is not None:
+                        lengths_ds[offset:next_offset] = src["lengths"][:]
                     offset = next_offset
 
                 pbar.update(1)
@@ -272,6 +318,9 @@ def merge_shards(
         out.attrs["generated_at"] = datetime.now().isoformat()
         out.attrs["theta_shape"] = list(theta_ds.shape)
         out.attrs["x_shape"] = list(x_ds.shape)
+        if lengths_ds is not None:
+            out.attrs["has_lengths"] = True
+            out.attrs["lengths_shape"] = list(lengths_ds.shape)
         out.attrs["source_shards"] = [str(shard.path) for shard in shard_infos]
 
     return n_total
@@ -292,7 +341,7 @@ def main() -> None:
     if not shard_files:
         raise FileNotFoundError("No input shard files remain after excluding the output path.")
 
-    shard_infos, theta_layout, x_layout = inspect_shards(shard_files)
+    shard_infos, theta_layout, x_layout, lengths_layout = inspect_shards(shard_files)
     validate_configs(shard_infos)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,6 +351,7 @@ def main() -> None:
         output_path=output_path,
         theta_layout=theta_layout,
         x_layout=x_layout,
+        lengths_layout=lengths_layout,
         compression_override=args.compression_opts,
     )
 

@@ -7,7 +7,14 @@ from omegaconf import OmegaConf
 
 
 def _unpack_physics_params(params, num_knots):
-    """Unpack the physics parameters shared by both simulator wrappers."""
+    """Unpack physics parameters, deriving the conserved crosstalk diagonals.
+
+    The prior samples only the leak fractions C_gr and C_rg; photon
+    conservation on each emission channel fixes C_gg = 1 − C_gr and
+    C_rr = 1 − C_rg.
+    """
+    C_gr = float(params[num_knots + 7])
+    C_rg = float(params[num_knots + 8])
     return dict(
         R0=params[num_knots + 1],
         kD=params[num_knots + 2],
@@ -15,10 +22,10 @@ def _unpack_physics_params(params, num_knots):
         k_rb=params[num_knots + 4],
         eta_g=params[num_knots + 5],
         eta_r=params[num_knots + 6],
-        C_gg=params[num_knots + 7],
-        C_rr=params[num_knots + 8],
-        C_gr=params[num_knots + 9],
-        C_rg=params[num_knots + 10],
+        C_gg=1.0 - C_gr,
+        C_rr=1.0 - C_rg,
+        C_gr=C_gr,
+        C_rg=C_rg,
     )
 
 

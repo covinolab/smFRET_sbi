@@ -1,4 +1,4 @@
-# Prior bounds for all inferred parameters (12 total)
+# Prior bounds for all inferred parameters (10 groups; total dim = num_knots + 9)
 prior:
   # Dynamics parameters
   logD_lims: [-0.5, 2]       # log10 of diffusion coefficient
@@ -15,9 +15,7 @@ prior:
   eta_g_lims: [0.95, 1.0]       # Green detector quantum efficiency
   eta_r_lims: [0.95, 1.0]       # Red detector quantum efficiency
   
-  # Cross-talk matrix (spectral bleed-through)
-  C_gg_lims: [0.95, 1.0]        # Prob green photon -> green detector
-  C_rr_lims: [0.95, 1.0]        # Prob red photon -> red detector
+  # Spectral leak fractions (diagonals derived: C_gg = 1 - C_gr, C_rr = 1 - C_rg)
   C_gr_lims: [0.0, 0.05]        # Prob green photon -> red detector
   C_rg_lims: [0.0, 0.05]        # Prob red photon -> green detector
 

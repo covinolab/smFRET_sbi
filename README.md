@@ -156,7 +156,7 @@ Two modes are available via `simulator.mode`:
 
 ### Prior
 
-The full prior factorises over 12 parameter groups (total dimension `num_knots + 11`):
+The full prior factorises over 10 parameter groups (total dimension `num_knots + 9`):
 
 | Parameter | Prior | Description |
 |-----------|-------|-------------|
@@ -165,16 +165,16 @@ The full prior factorises over 12 parameter groups (total dimension `num_knots +
 | `R0`, `kD` | Uniform | Förster radius, donor excitation rate |
 | `k_gb`, `k_rb` | Uniform | Green / red background photon rates |
 | `eta_g`, `eta_r` | Uniform | Green / red detector quantum efficiencies |
-| `C_gg`, `C_rr`, `C_gr`, `C_rg` | Uniform | Cross-talk matrix entries |
+| `C_gr`, `C_rg` | Uniform | Spectral leak fractions; diagonals `C_gg = 1 − C_gr` and `C_rr = 1 − C_rg` are derived by the simulator wrapper to conserve photons per emission channel. |
 
 The parameter vector ordering used throughout the code (see [priors.py](src/priors.py)) is:
 
 ```
-[logD, g_0, …, g_{n-1}, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gg, C_rr, C_gr, C_rg]
+[logD, g_0, …, g_{n-1}, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg]
 ```
 
 Helper functions:
-- `generate_spline_fret_prior(...)` — full prior (12 groups)
+- `generate_spline_fret_prior(...)` — full prior (10 groups)
 - `generate_posterior_prior_from_config(...)` — reduced prior for posterior sampling restricted to `[logD, g_0..g_{n-1}, R0]`
 - `generate_fret_prior_from_config(cfg)` — build the prior from a YAML config
 
@@ -191,8 +191,7 @@ prior:
   k_rb_lims: [0.0, 0.25]
   eta_g_lims: [0.7, 1.0]
   eta_r_lims: [0.7, 1.0]
-  C_gg_lims: [0.8, 1.0]
-  C_rr_lims: [0.8, 1.0]
+  # Spectral leak fractions (C_gg = 1 - C_gr, C_rr = 1 - C_rg)
   C_gr_lims: [0.0, 0.2]
   C_rg_lims: [0.0, 0.2]
   num_knots: 5                 # n force-gradient knots

@@ -17,9 +17,11 @@ src/                          # All source code
                               #   - binding_simulator_wrapper      (transition paths)
                               #   - *_from_config() variants
   priors.py                   # generate_spline_fret_prior() → MultipleIndependent
-                              # Param order:
+                              # Param order (total dim = num_knots + 9):
                               #   [logD, g₀..g_{n-1}, R0, kD, k_gb, k_rb,
-                              #    eta_g, eta_r, C_gg, C_rr, C_gr, C_rg]
+                              #    eta_g, eta_r, C_gr, C_rg]
+                              # Crosstalk diagonals derived in the simulator
+                              # wrapper: C_gg = 1 - C_gr, C_rr = 1 - C_rg.
   utils.py                    # make_spline_knots, integrate_force_to_energy,
                               # eval_free_energy/force, DDP helpers,
                               # checkpoint save/load, seed, git-commit logging

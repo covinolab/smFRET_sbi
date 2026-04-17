@@ -34,8 +34,6 @@ def generate_spline_fret_prior(
     k_rb_lims: tuple = (0.0, 0.1),
     eta_g_lims: tuple = (0.5, 1.0),
     eta_r_lims: tuple = (0.5, 1.0),
-    C_gg_lims: tuple = (0.8, 1.0),
-    C_rr_lims: tuple = (0.8, 1.0),
     C_gr_lims: tuple = (0.0, 0.2),
     C_rg_lims: tuple = (0.0, 0.2),
     center: Union[torch.Tensor, List[float], None] = None,
@@ -45,9 +43,13 @@ def generate_spline_fret_prior(
     """
     Build the full FRET prior: logD + gradient knots + photophysics.
 
+    The crosstalk matrix is conserved by construction: only the two leak
+    fractions C_gr (green → red) and C_rg (red → green) are sampled; the
+    diagonals are derived downstream as C_gg = 1 − C_gr and C_rr = 1 − C_rg.
+
     Parameter order: [logD, g₀…gₙ₋₁, R0, kD, k_gb, k_rb, eta_g, eta_r,
-                      C_gg, C_rr, C_gr, C_rg]
-    Total length: num_knots + 11
+                      C_gr, C_rg]
+    Total length: num_knots + 9
 
     Args:
         num_knots: Number of spline knots n; prior holds n gradient knot values.
@@ -78,7 +80,7 @@ def generate_spline_fret_prior(
 
     phys_lims = [
         R0_lims, kD_lims, k_gb_lims, k_rb_lims,
-        eta_g_lims, eta_r_lims, C_gg_lims, C_rr_lims, C_gr_lims, C_rg_lims,
+        eta_g_lims, eta_r_lims, C_gr_lims, C_rg_lims,
     ]
     phys_priors = [
         dists.Uniform(torch.tensor([lo], device=device), torch.tensor([hi], device=device))
@@ -110,8 +112,6 @@ def generate_fret_prior_from_config(cfg, device: str = "cpu") -> MultipleIndepen
         k_rb_lims=tuple(cfg.prior.k_rb_lims),
         eta_g_lims=tuple(cfg.prior.eta_g_lims),
         eta_r_lims=tuple(cfg.prior.eta_r_lims),
-        C_gg_lims=tuple(cfg.prior.C_gg_lims),
-        C_rr_lims=tuple(cfg.prior.C_rr_lims),
         C_gr_lims=tuple(cfg.prior.C_gr_lims),
         C_rg_lims=tuple(cfg.prior.C_rg_lims),
         center=center,

@@ -7,7 +7,7 @@
 *.csv
 .vscode/
 todo.txt
-
+jobs/
 !figure.png
 
 # Byte-compiled / optimized / DLL files

@@ -11,8 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import numpy as np
 import yaml
 from tqdm import tqdm
+
+
+DEFAULT_MAX_BATCH_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -74,7 +78,34 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional gzip compression level override for the merged output",
     )
+    parser.add_argument(
+        "--max-batch-bytes",
+        type=int,
+        default=DEFAULT_MAX_BATCH_BYTES,
+        help=(
+            "Upper bound (in bytes) on the uncompressed size of a single "
+            "read/write batch per dataset. Controls peak RAM during merging."
+        ),
+    )
     return parser.parse_args()
+
+
+def rows_per_batch(layout: DatasetLayout, max_bytes: int) -> int:
+    tail = layout.tail_shape or (1,)
+    per_row = layout.dtype.itemsize * int(np.prod(tail))
+    return max(1, max_bytes // per_row)
+
+
+def stream_copy(
+    src_ds: h5py.Dataset,
+    dst_ds: h5py.Dataset,
+    dst_offset: int,
+    n_rows: int,
+    batch: int,
+) -> None:
+    for start in range(0, n_rows, batch):
+        end = min(start + batch, n_rows)
+        dst_ds[dst_offset + start : dst_offset + end] = src_ds[start:end]
 
 
 def natural_sort_key(path: Path) -> list[Any]:
@@ -273,9 +304,18 @@ def merge_shards(
     x_layout: DatasetLayout,
     lengths_layout: DatasetLayout | None,
     compression_override: int | None,
+    max_batch_bytes: int,
 ) -> int:
     n_total = total_samples(shard_infos)
     theta_dim = theta_layout.tail_shape[0]
+
+    theta_batch = rows_per_batch(theta_layout, max_batch_bytes)
+    x_batch = rows_per_batch(x_layout, max_batch_bytes)
+    lengths_batch = (
+        rows_per_batch(lengths_layout, max_batch_bytes)
+        if lengths_layout is not None
+        else None
+    )
 
     with h5py.File(output_path, "w", libver="latest") as out:
         theta_ds = out.create_dataset(
@@ -304,10 +344,12 @@ def merge_shards(
             for shard in shard_infos:
                 with h5py.File(shard.path, "r") as src:
                     next_offset = offset + shard.num_samples
-                    theta_ds[offset:next_offset] = src["theta"][:]
-                    x_ds[offset:next_offset] = src["x"][:]
+                    stream_copy(src["theta"], theta_ds, offset, shard.num_samples, theta_batch)
+                    stream_copy(src["x"], x_ds, offset, shard.num_samples, x_batch)
                     if lengths_ds is not None:
-                        lengths_ds[offset:next_offset] = src["lengths"][:]
+                        stream_copy(
+                            src["lengths"], lengths_ds, offset, shard.num_samples, lengths_batch
+                        )
                     offset = next_offset
 
                 pbar.update(1)
@@ -353,6 +395,7 @@ def main() -> None:
         x_layout=x_layout,
         lengths_layout=lengths_layout,
         compression_override=args.compression_opts,
+        max_batch_bytes=args.max_batch_bytes,
     )
 
     if args.bundle_dir is not None:

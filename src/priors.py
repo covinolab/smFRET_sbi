@@ -146,3 +146,29 @@ def generate_posterior_prior_from_config(cfg, device: str = "cpu") -> MultipleIn
     )
 
     return MultipleIndependent([prior_logD, *prior_spline, prior_R0], device=device)
+
+
+def generate_nuisance_prior_from_config(cfg, device: str = "cpu") -> MultipleIndependent:
+    """
+    Photophysics-only prior over the 7 nuisance parameters that vary per trace.
+
+    Parameter order: [kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg]. Total length: 7.
+    Shares bounds with ``generate_fret_prior_from_config`` via the same config keys.
+    """
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+
+    phys_lims = [
+        tuple(cfg.prior.kD_lims),
+        tuple(cfg.prior.k_gb_lims),
+        tuple(cfg.prior.k_rb_lims),
+        tuple(cfg.prior.eta_g_lims),
+        tuple(cfg.prior.eta_r_lims),
+        tuple(cfg.prior.C_gr_lims),
+        tuple(cfg.prior.C_rg_lims),
+    ]
+    phys_priors = [
+        dists.Uniform(torch.tensor([lo], device=device), torch.tensor([hi], device=device))
+        for lo, hi in phys_lims
+    ]
+
+    return MultipleIndependent(phys_priors, device=device)

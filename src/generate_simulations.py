@@ -19,25 +19,29 @@ logger = logging.getLogger(__name__)
 
 from simulator import smFRET_simulator_wrapper as fret_simulator
 from simulator import binding_simulator_wrapper as binding_simulator
-from priors import generate_fret_prior_from_config
+from priors import (
+    generate_posterior_prior_from_config,
+    generate_nuisance_prior_from_config,
+)
+from utils import _validate_bc
 
 
 # ── Multiprocessing workers ─────────────────────────────────────────────────
 
 _worker_sim_fn = None
-_worker_theta_dim = None
+_worker_nuisance_prior = None
 _worker_out_queue = None
 _worker_has_lengths = False
 _worker_num_traces = 1
 _worker_max_traj_retries = 50
 
 
-def _init_worker(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths,
+def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior, has_lengths,
                  num_traces=1, max_traj_retries=1):
     """Initialise per-worker shared state (called once per pool worker)."""
-    global _worker_sim_fn, _worker_theta_dim, _worker_out_queue
+    global _worker_sim_fn, _worker_nuisance_prior, _worker_out_queue
     global _worker_has_lengths, _worker_num_traces, _worker_max_traj_retries
-    _worker_theta_dim = theta_dim
+    _worker_nuisance_prior = nuisance_prior
     _worker_out_queue = out_queue
     _worker_has_lengths = has_lengths
     _worker_num_traces = num_traces
@@ -48,7 +52,13 @@ def _init_worker(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths,
 
 
 def _worker_simulate_batch(batch_theta):
-    """Simulate a batch, push results to the writer queue, return success count."""
+    """Simulate a batch, push results to the writer queue, return success count.
+
+    Each trace draws its own fresh nuisance sample. Within a set, the inferred
+    portion (``batch_theta[i]``) is shared across all N traces, while nuisance
+    is independent per trace — matching how real single-molecule experiments
+    produce multiple molecules under one physical condition.
+    """
     results_theta, results_x, results_lengths = [], [], []
     N = _worker_num_traces
 
@@ -58,7 +68,9 @@ def _worker_simulate_batch(batch_theta):
         for _ in range(N):
             result = None
             for _attempt in range(_worker_max_traj_retries):
-                result = _worker_sim_fn(batch_theta[i])
+                nuisance = _worker_nuisance_prior.sample((1,)).squeeze(0)
+                theta_for_sim = torch.cat([batch_theta[i], nuisance])
+                result = _worker_sim_fn(theta_for_sim)
                 if result is not None:
                     break
             if result is None:
@@ -81,7 +93,7 @@ def _worker_simulate_batch(batch_theta):
             results_x.append(traces[0])
             if _worker_has_lengths:
                 results_lengths.append(lengths[0])
-        results_theta.append(batch_theta[i][:_worker_theta_dim].numpy())
+        results_theta.append(batch_theta[i].numpy())
 
     if not results_theta:
         return 0
@@ -203,12 +215,15 @@ def parse_args():
 
 # ── Simulation orchestration ───────────────────────────────────────────────
 
-def _determine_output_shape(sim_fn, sim_kwargs, prior, has_lengths=False,
+def _determine_output_shape(sim_fn, sim_kwargs, prior, nuisance_prior,
+                            has_lengths=False,
                             num_traces_per_set=1, max_attempts=100):
     """Run test simulations to discover the observation tensor shape."""
     fn = partial(sim_fn, **sim_kwargs)
     for _ in range(max_attempts):
-        theta = prior.sample((1,)).squeeze(0)
+        inferred = prior.sample((1,)).squeeze(0)
+        nuisance = nuisance_prior.sample((1,)).squeeze(0)
+        theta = torch.cat([inferred, nuisance])
         result = fn(theta)
         if result is not None:
             if has_lengths:
@@ -233,8 +248,8 @@ def _prepare_output_dir(output_dir_arg, cfg_output_dir, use_timestamp):
     return output_dir
 
 
-def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
-                         sim_kwargs, theta_dim, num_simulations,
+def _run_simulation_pool(prior, nuisance_prior, batch_size, num_workers,
+                         out_queue, sim_fn, sim_kwargs, num_simulations,
                          written_counter, writer_process=None,
                          has_lengths=False,
                          num_traces_per_set=1, max_traj_retries=1,
@@ -243,7 +258,7 @@ def _run_simulation_pool(prior, batch_size, num_workers, out_queue, sim_fn,
     pool = mp.Pool(
         num_workers,
         initializer=_init_worker,
-        initargs=(out_queue, sim_fn, sim_kwargs, theta_dim, has_lengths,
+        initargs=(out_queue, sim_fn, sim_kwargs, nuisance_prior, has_lengths,
                   num_traces_per_set, max_traj_retries),
     )
     total_simulated = 0
@@ -309,11 +324,13 @@ def generate_simulations(cfg, args):
     num_traces_per_set = int(cfg.data_generation.get("num_traces_per_set", 1))
     max_traj_retries = int(cfg.data_generation.get("max_traj_retries", 1))
 
-    prior = generate_fret_prior_from_config(cfg, device="cpu")
+    prior = generate_posterior_prior_from_config(cfg, device="cpu")
+    nuisance_prior = generate_nuisance_prior_from_config(cfg, device="cpu")
 
     # Mode dispatch — build sim_fn and sim_kwargs
     mode = str(cfg.simulator.get("mode", "equilibrium")).lower()
     has_lengths = (mode == "binding")
+    bc = _validate_bc(cfg.simulator.boundary_condition, allow_open=(mode == "binding"))
     sim_kwargs = dict(
         dt=cfg.simulator.time_step,
         saving_freq=cfg.simulator.saving_frequency,
@@ -321,7 +338,7 @@ def generate_simulations(cfg, args):
         x_max=cfg.simulator.x_max,
         num_knots=cfg.prior.num_knots,
         max_force=cfg.simulator.max_force,
-        boundary_condition=cfg.simulator.boundary_condition,
+        boundary_condition=bc,
         spline_type=cfg.simulator.spline_type,
         num_boundary_knots=cfg.simulator.num_boundary_knots,
     )
@@ -333,6 +350,8 @@ def generate_simulations(cfg, args):
             k_persist=binding_cfg.k_persist,
             landmark_grid_n=binding_cfg.get("landmark_grid_n", 400),
             N_max=binding_cfg.get("N_max", 200000000),
+            open_left=int(bc[0] == "open"),
+            open_right=int(bc[1] == "open"),
         )
         sim_fn = binding_simulator
         print("Mode: binding (h-transform, variable-length traces)")
@@ -345,13 +364,14 @@ def generate_simulations(cfg, args):
         print("Mode: equilibrium (fixed-length traces)")
 
     if num_traces_per_set > 1:
-        print(f"Set-based mode: {num_traces_per_set} iid traces per parameter set")
+        print(f"Set-based mode: {num_traces_per_set} traces per set "
+              f"(shared inferred params, per-trace nuisance resampling)")
     if max_traj_retries > 1:
         print(f"Per-trajectory retries: {max_traj_retries}")
 
     # Discover observation shape
     print("Running test simulation to determine output shape...")
-    x_shape = _determine_output_shape(sim_fn, sim_kwargs, prior,
+    x_shape = _determine_output_shape(sim_fn, sim_kwargs, prior, nuisance_prior,
                                       has_lengths=has_lengths,
                                       num_traces_per_set=num_traces_per_set)
     print(f"  theta dim: {theta_dim}, observation shape: {x_shape}")
@@ -381,8 +401,8 @@ def generate_simulations(cfg, args):
 
     # Run simulations
     _, sim_bar, write_bar = _run_simulation_pool(
-        prior, batch_size, num_workers, out_queue, sim_fn, sim_kwargs,
-        theta_dim, num_simulations, written_counter, writer_process=writer,
+        prior, nuisance_prior, batch_size, num_workers, out_queue, sim_fn,
+        sim_kwargs, num_simulations, written_counter, writer_process=writer,
         has_lengths=has_lengths,
         num_traces_per_set=num_traces_per_set,
         max_traj_retries=max_traj_retries,

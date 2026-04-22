@@ -1,7 +1,7 @@
 from functools import partial
 import torch
 import numpy as np
-from utils import make_spline_knots
+from utils import make_spline_knots, _validate_bc
 from smFRET_simulator import smFRET_simulator, binding_simulator
 from omegaconf import OmegaConf
 
@@ -30,16 +30,16 @@ def _unpack_physics_params(params, num_knots):
 
 
 def smFRET_simulator_wrapper(
-                params, 
-                dt=5e-4, 
-                saving_freq=1, 
-                T=10000.0, 
+                params,
+                dt=5e-4,
+                saving_freq=1,
+                T=10000.0,
                 x_init=(3.0, 7.0),
                 x_min=0.0,
                 x_max=10.0,
                 num_knots=10,
                 max_force=10.0,
-                boundary_condition='diffusive',
+                boundary_condition=("linear", "linear"),
                 spline_type="cubic",
                 num_boundary_knots=4,
                 return_torch=False
@@ -98,7 +98,7 @@ def smFRET_simulator_wrapper_from_config(cfg: str):
     saving_frequency = cfg.simulator.saving_frequency
     time_step = cfg.simulator.time_step
     spline_type = cfg.simulator.spline_type
-    boundary_condition = cfg.simulator.boundary_condition
+    boundary_condition = _validate_bc(cfg.simulator.boundary_condition, allow_open=False)
     num_knots = cfg.prior.num_knots
     max_force = cfg.simulator.max_force
     x_min = cfg.simulator.x_min
@@ -131,7 +131,7 @@ def binding_simulator_wrapper(
                 x_max=14.0,
                 num_knots=5,
                 max_force=30.0,
-                boundary_condition='linear',
+                boundary_condition=("linear", "linear"),
                 spline_type="cubic",
                 num_boundary_knots=3,
                 L_min_bins=200,
@@ -139,6 +139,8 @@ def binding_simulator_wrapper(
                 k_persist=20,
                 landmark_grid_n=400,
                 N_max=200000000,
+                open_left=0,
+                open_right=0,
                 return_torch=False
     ):
         x_knots, y_knots = make_spline_knots(
@@ -167,6 +169,8 @@ def binding_simulator_wrapper(
                 landmark_grid_n=landmark_grid_n,
                 N_max=N_max,
                 spline_type=spline_type,
+                open_left=open_left,
+                open_right=open_right,
         )
         if kG_photons is None or kR_photons is None:
             return None
@@ -189,6 +193,7 @@ def binding_simulator_wrapper_from_config(cfg: str):
     cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
 
     binding_cfg = cfg.simulator.get("binding", {})
+    left_bc, right_bc = _validate_bc(cfg.simulator.boundary_condition)
 
     return partial(
         binding_simulator_wrapper,
@@ -198,7 +203,7 @@ def binding_simulator_wrapper_from_config(cfg: str):
         x_max=cfg.simulator.x_max,
         num_knots=cfg.prior.num_knots,
         max_force=cfg.simulator.max_force,
-        boundary_condition=cfg.simulator.boundary_condition,
+        boundary_condition=(left_bc, right_bc),
         spline_type=cfg.simulator.spline_type,
         num_boundary_knots=cfg.simulator.num_boundary_knots,
         L_min_bins=binding_cfg.L_min_bins,
@@ -206,5 +211,7 @@ def binding_simulator_wrapper_from_config(cfg: str):
         k_persist=binding_cfg.k_persist,
         landmark_grid_n=binding_cfg.get("landmark_grid_n", 400),
         N_max=binding_cfg.get("N_max", 200000000),
+        open_left=int(left_bc == "open"),
+        open_right=int(right_bc == "open"),
         return_torch=True
     )

@@ -30,7 +30,7 @@ simulator:
   saving_frequency: 1500
   time_step: 5e-4
   spline_type: "cubic"
-  boundary_condition: "linear"  # "quadratic" or "linear"
+  boundary_condition: [linear, linear]  # [left, right]; each of "linear", "quadratic", "open"
   num_boundary_knots: 6
   max_force: 60.0
   x_min: 6.0

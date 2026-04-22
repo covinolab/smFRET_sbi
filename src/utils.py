@@ -230,6 +230,59 @@ def assert_equal_train_steps(local_steps: int, device: torch.device):
     return steps_per_rank
 
 
+_ALLOWED_BCS = ("linear", "quadratic", "open")
+
+
+def _validate_bc(bc, allow_open=True):
+    """Normalise a 2-element boundary-condition spec into a (left, right) tuple.
+
+    Raises ValueError on length mismatch, unknown value, or — when
+    ``allow_open=False`` — any ``"open"`` entry.
+    """
+    try:
+        items = list(bc)
+    except TypeError:
+        raise ValueError(
+            f"boundary_condition must be a 2-element list [left, right]; got {bc!r}"
+        )
+    if len(items) != 2:
+        raise ValueError(
+            f"boundary_condition must have exactly 2 elements, got {len(items)}: {bc!r}"
+        )
+    left, right = str(items[0]), str(items[1])
+    for side, val in (("left", left), ("right", right)):
+        if val not in _ALLOWED_BCS:
+            raise ValueError(
+                f"Unsupported boundary_condition on {side} side: {val!r} "
+                f"(allowed: {_ALLOWED_BCS})"
+            )
+        if not allow_open and val == "open":
+            raise ValueError(
+                f"boundary_condition {val!r} is not allowed on the {side} side "
+                f"for this simulator.mode (equilibrium mode cannot contain "
+                f"particles with an open boundary)"
+            )
+    return left, right
+
+
+def _boundary_slots(edge_value, direction, bc, max_force, N):
+    """Return N boundary-knot force values ordered innermost → outermost.
+
+    ``direction`` is +1 for the left side (force grows positive outward) and
+    −1 for the right side (force grows negative outward).
+    """
+    if bc == "open":
+        return np.zeros(N)
+    slots = np.empty(N)
+    for j in range(1, N + 1):
+        if bc == "linear":
+            delta = direction * j * (max_force / N)
+        else:  # "quadratic" — _validate_bc has already ruled out other values
+            delta = direction * (j / N) ** 2 * max_force
+        slots[j - 1] = edge_value + delta
+    return slots
+
+
 def make_spline_knots(
     params,
     x_min=0.0,
@@ -237,32 +290,21 @@ def make_spline_knots(
     num_knots=10,
     max_force=10.0,
     num_boundary_knots=3,
-    boundary_condition="bound",
+    boundary_condition=("linear", "linear"),
 ):
-    # params[1:num_knots+1] holds all n gradient knots g₀…gₙ₋₁.
-    # No anchor is needed: force has no additive ambiguity.
+    left_bc, right_bc = _validate_bc(boundary_condition)
     g_inner = np.asarray(params[1:num_knots + 1], dtype=np.float64)
-
     knot_spacing = (x_max - x_min) / (num_knots - 1)
+    N = num_boundary_knots
     x_knots = np.linspace(
-        x_min - num_boundary_knots * knot_spacing,
-        x_max + num_boundary_knots * knot_spacing,
-        num_knots + 2 * num_boundary_knots,
+        x_min - N * knot_spacing,
+        x_max + N * knot_spacing,
+        num_knots + 2 * N,
     )
-    y_knots = np.zeros(num_knots + 2 * num_boundary_knots)
-    for i in range(1, num_boundary_knots + 1):
-        if boundary_condition == "linear":
-            # Right boundary: force becomes increasingly negative (pushing inward)
-            y_knots[-num_boundary_knots + i] = g_inner[-1] - i * (max_force / num_boundary_knots)
-            # Left boundary: force becomes increasingly positive (pushing inward)
-            y_knots[num_boundary_knots - i - 1] = g_inner[0] + i * (max_force / num_boundary_knots)
-        elif boundary_condition == "quadratic":
-            y_knots[-num_boundary_knots + i - 1] = g_inner[-1] - (i / num_boundary_knots) ** 2 * max_force
-            y_knots[num_boundary_knots - i] = g_inner[0] + (i / num_boundary_knots) ** 2 * max_force
-        else:
-            raise ValueError(f"Unsupported boundary_condition: {boundary_condition}")
-
-    y_knots[num_boundary_knots:-num_boundary_knots] = g_inner
+    y_knots = np.zeros(num_knots + 2 * N)
+    y_knots[N:-N] = g_inner
+    y_knots[:N] = _boundary_slots(g_inner[0], +1, left_bc, max_force, N)[::-1]
+    y_knots[-N:] = _boundary_slots(g_inner[-1], -1, right_bc, max_force, N)
     return x_knots, y_knots
 
 

@@ -34,7 +34,7 @@ simulator:
   saving_frequency: 10000
   time_step: 5e-5
   spline_type: "cubic"
-  boundary_condition: "linear"
+  boundary_condition: [linear, linear]
   num_boundary_knots: 3
   max_force: 30.0
   x_min: 4.0

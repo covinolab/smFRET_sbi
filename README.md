@@ -139,7 +139,7 @@ $$
 
 This gradient parameterisation avoids the additive zero-point ambiguity of potential-height parameterisations: any constant shift in $U$ leaves the dynamics unchanged, which would otherwise make the inference problem non-identifiable.
 
-The spline interpolation type (`cubic`, `steffen`, `akima`) is chosen via `simulator.spline_type`. Boundary behaviour beyond `x_min` / `x_max` is controlled by `boundary_condition` together with `num_boundary_knots`, which adds additional knots to define how the force extrapolates (e.g. `linear` extrapolation outside the support of the interior knots).
+The spline interpolation type (`cubic`, `steffen`, `akima`) is chosen via `simulator.spline_type`. Boundary behaviour beyond `x_min` / `x_max` is controlled by `boundary_condition` (a 2-element list `[left, right]`) together with `num_boundary_knots`, which adds additional knots to define how the force extrapolates. Each side takes one of `linear`, `quadratic`, or `open` (zero force outside — only supported in binding mode; equilibrium mode rejects `open` at config time).
 
 Knot helper functions live in [utils.py](src/utils.py): `make_spline_knots`, `integrate_force_to_energy`, `eval_free_energy`, `eval_force`.
 
@@ -204,7 +204,7 @@ simulator:
   saving_frequency: 10000      # photon-binning window (simulation steps per bin)
   time_step: 5e-5
   spline_type: cubic           # cubic | steffen | akima
-  boundary_condition: linear
+  boundary_condition: [linear, linear]
   num_boundary_knots: 3
   max_force: 30.0              # soft force magnitude cap (numerical stability)
   x_min: 4.0

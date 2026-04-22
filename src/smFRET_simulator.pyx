@@ -221,7 +221,11 @@ cdef int _shoot_leg(
         _gsl_spline.gsl_spline *force_spline,
         _gsl_spline.gsl_interp_accel *acc_force,
         grn.gsl_rng *rng,
-        int *out_len
+        int *out_len,
+        double x_min_val,
+        double x_max_val,
+        int open_left,
+        int open_right
         ):
     """
     Shoot one Langevin leg from x_start under the unbiased SDE.
@@ -248,9 +252,13 @@ cdef int _shoot_leg(
 
         status = _gsl_spline.gsl_spline_eval_e(force_spline, x, acc_force, &sval)
         if status != 0:
-            out_len[0] = bin_idx
-            return -1
-        F = sval
+            if (x < x_min_val and open_left) or (x > x_max_val and open_right):
+                F = 0.0
+            else:
+                out_len[0] = bin_idx
+                return -1
+        else:
+            F = sval
 
         x = x + Ax * F + Bx * grn.gsl_ran_gaussian_ziggurat(rng, 1.0)
 
@@ -279,7 +287,7 @@ cdef int _shoot_leg(
 @cython.boundscheck(False)
 @cython.wraparound(False)
 @cython.cdivision(True)
-cdef void _pad_in_basin(
+cdef int _pad_in_basin(
         double *leg,
         int current_len,
         int target_len,
@@ -288,32 +296,45 @@ cdef void _pad_in_basin(
         double Bx,
         _gsl_spline.gsl_spline *force_spline,
         _gsl_spline.gsl_interp_accel *acc_force,
-        grn.gsl_rng *rng
+        grn.gsl_rng *rng,
+        double x_min_val,
+        double x_max_val,
+        int open_left,
+        int open_right
         ):
     """
     Continue the unbiased SDE from leg[current_len - 1], writing one bin every
-    `saving_freq` raw steps until the leg has `target_len` bins. No commitment
-    checks, no rejection — just keeps the trajectory going inside whatever
-    basin it has already committed to.
+    `saving_freq` raw steps until the leg has `target_len` bins.
+
+    Returns 0 on success, -1 on confining-side spline escape (caller must
+    treat the leg buffer as invalid).
     """
     cdef double x
     cdef double sval, F
     cdef int bin_idx
     cdef int s
+    cdef int status = 0
 
     if current_len <= 0 or current_len >= target_len:
-        return
+        return 0
 
     x = leg[current_len - 1]
     bin_idx = current_len
 
     while bin_idx < target_len:
         for s in range(saving_freq):
-            _gsl_spline.gsl_spline_eval_e(force_spline, x, acc_force, &sval)
-            F = sval
+            status = _gsl_spline.gsl_spline_eval_e(force_spline, x, acc_force, &sval)
+            if status != 0:
+                if (x < x_min_val and open_left) or (x > x_max_val and open_right):
+                    F = 0.0
+                else:
+                    return -1
+            else:
+                F = sval
             x = x + Ax * F + Bx * grn.gsl_ran_gaussian_ziggurat(rng, 1.0)
         leg[bin_idx] = x
         bin_idx += 1
+    return 0
 
 
 @cython.boundscheck(False)
@@ -324,21 +345,30 @@ cdef void _locate_landmarks(
         _gsl_spline.gsl_interp_accel *acc,
         double x_min,
         double x_max,
+        double margin,
         int n,
-        double *x_A_out,
-        double *x_B_out,
         double *x_TS_out
         ):
     """
-    Locate the two basin minima and the barrier top of U(x) on [x_min, x_max].
+    Locate the barrier top of U(x) on [x_min - margin, x_max + margin].
 
-    U(x) = -∫_{x_min}^{x} F(s) ds is gridded with n points. x_A is argmin on
-    the left half, x_B is argmin on the right half, x_TS is argmax on
-    [x_A, x_B].
+    U(x) = -∫_{x_lo}^{x} F(s) ds (with x_lo = x_min - margin) is gridded
+    with n points over the extended search domain [x_lo, x_max + margin].
+    Using x_lo as the integration reference — rather than x_min — keeps
+    the GSL integrator's required a ≤ b direction for every sample, and
+    is harmless here because U is defined only up to an additive constant. The basin minima x_A (argmin on the left half) and x_B
+    (argmin on the right half) are computed internally to bound the barrier-
+    top search; only x_TS — the argmax on [x_A, x_B] — is returned. The
+    margin lets the search reach into the first padded knot on each side,
+    so that true basin minima sitting just outside [x_min, x_max] (e.g. at
+    an F=0 crossover between the innermost inner knot and the first linear-
+    pad knot) are picked up instead of being clamped to x_min/x_max.
     """
     cdef int j
     cdef int mid = n // 2
-    cdef double dx = (x_max - x_min) / (n - 1)
+    cdef double x_lo = x_min - margin
+    cdef double x_hi = x_max + margin
+    cdef double dx = (x_hi - x_lo) / (n - 1)
     cdef double xj, U
     cdef int j_A = 0
     cdef int j_B = n - 1
@@ -348,8 +378,8 @@ cdef void _locate_landmarks(
     cdef double U_max = -1e300
 
     for j in range(n):
-        xj = x_min + j * dx
-        U = -_gsl_spline.gsl_spline_eval_integ(force_spline, x_min, xj, acc)
+        xj = x_lo + j * dx
+        U = -_gsl_spline.gsl_spline_eval_integ(force_spline, x_lo, xj, acc)
         if j <= mid:
             if U < U_min_left:
                 U_min_left = U
@@ -359,17 +389,14 @@ cdef void _locate_landmarks(
                 U_min_right = U
                 j_B = j
 
-    x_A_out[0] = x_min + j_A * dx
-    x_B_out[0] = x_min + j_B * dx
-
     for j in range(j_A, j_B + 1):
-        xj = x_min + j * dx
-        U = -_gsl_spline.gsl_spline_eval_integ(force_spline, x_min, xj, acc)
+        xj = x_lo + j * dx
+        U = -_gsl_spline.gsl_spline_eval_integ(force_spline, x_lo, xj, acc)
         if U > U_max:
             U_max = U
             j_TS = j
 
-    x_TS_out[0] = x_min + j_TS * dx
+    x_TS_out[0] = x_lo + j_TS * dx
 
 
 @cython.boundscheck(False)
@@ -398,22 +425,26 @@ def binding_simulator(
         int k_persist,
         int landmark_grid_n,
         long N_max=200000000,
-        str spline_type='cubic'
+        str spline_type='cubic',
+        int open_left=0,
+        int open_right=0
         ):
     """
     Two-way shooting transition-path simulator (unbiased Langevin).
 
-    Locates the basin minima x_A, x_B and the barrier top x_TS from the force
-    spline, then shoots two independent unbiased Langevin legs from x_TS.
-    Each leg is run until it commits to a basin (k_persist consecutive saved
-    bins on one side of x_TS) or fails (exceeds half * saving_freq saved
-    steps or N_max raw steps). If both legs commit to the same basin the
-    trajectory is non-reactive and rejected. Otherwise each leg is padded by
-    additional in-basin diffusion to reach exactly L_max_bins // 2 bins, the
-    two legs are concatenated (with the "backward" leg reversed) so the
-    transition sits at the midpoint, then a window of random length
-    L_j ∈ [L_min_bins, L_max_bins] is taken centered on the transition and
-    used to emit FRET photons.
+    Locates the barrier top x_TS from the force spline, then shoots two
+    independent unbiased Langevin legs from x_TS. Each leg is run until it
+    commits to a basin (k_persist consecutive saved bins on one side of x_TS)
+    or fails (exceeds half * saving_freq saved steps or N_max raw steps). If
+    both legs commit to the same basin the trajectory is non-reactive and
+    rejected. Otherwise each leg is padded by additional in-basin diffusion
+    to reach exactly L_max_bins // 2 bins and the two legs are concatenated
+    (with the "backward" leg reversed) so the (unbound → bound) transition
+    sits near the midpoint. The output window is then cropped symmetrically
+    around the *FRET midpoint crossing* r = R0 (not x_TS), and a random
+    length L_j ∈ [L_min_bins, L_max_bins] of FRET photons is emitted from
+    that window. If R0 lies outside the range spanned by the trajectory
+    (i.e. the latent r never crosses R0), the trajectory is rejected.
 
     Parameters
     ----------
@@ -437,7 +468,7 @@ def binding_simulator(
     k_persist : int
         Consecutive bins inside a basin required to declare commitment.
     landmark_grid_n : int
-        Grid size used by _locate_landmarks for finding x_A, x_B, x_TS.
+        Grid size used by _locate_landmarks for finding x_TS.
     N_max : long
         Per-leg hard cap on raw integration steps (safety guard).
     spline_type : str
@@ -491,12 +522,20 @@ def binding_simulator(
 
     _gsl_spline.gsl_spline_init(force_spline, x_k, y_k, N_knots)
 
-    # Locate landmarks (x_A, x_B, x_TS) directly from the force spline
-    cdef double x_A_val = 0.0
-    cdef double x_B_val = 0.0
+    # Locate the barrier top x_TS directly from the force spline. Extend
+    # the search by one inner-knot spacing on each side so true basin minima
+    # sitting just past [x_min, x_max] (e.g. at an F=0 crossover into the
+    # first linear-pad knot) are picked up instead of clamped to x_min/x_max.
+    cdef double knot_spacing = x_knots[1] - x_knots[0]
     cdef double x_TS_val = 0.0
-    _locate_landmarks(force_spline, acc_force, x_min, x_max, landmark_grid_n,
-                      &x_A_val, &x_B_val, &x_TS_val)
+    _locate_landmarks(force_spline, acc_force, x_min, x_max, knot_spacing,
+                      landmark_grid_n, &x_TS_val)
+
+    # Output-window centering threshold. The saddle x_TS governs *kinetic*
+    # commitment inside _shoot_leg (leg termination), but the experimentally
+    # observed FRET transition sits at E(r) = 0.5, i.e. r = R0. Crop the
+    # emitted photon window symmetrically around the crossing of r_mid.
+    cdef double r_mid = R0
 
     # Langevin coefficients
     cdef double Ax = Dx * dt
@@ -522,12 +561,14 @@ def binding_simulator(
     for attempt in range(max_shoot_attempts):
         basin_fwd = _shoot_leg(leg_fwd, half, saving_freq, x_TS_val, x_TS_val,
                                k_persist, N_max, Ax, Bx,
-                               force_spline, acc_force, rng, &leg_len_fwd)
+                               force_spline, acc_force, rng, &leg_len_fwd,
+                               x_min, x_max, open_left, open_right)
         if basin_fwd < 0:
             continue
         basin_bwd = _shoot_leg(leg_bwd, half, saving_freq, x_TS_val, x_TS_val,
                                k_persist, N_max, Ax, Bx,
-                               force_spline, acc_force, rng, &leg_len_bwd)
+                               force_spline, acc_force, rng, &leg_len_bwd,
+                               x_min, x_max, open_left, open_right)
         if basin_bwd < 0:
             continue
         if basin_fwd != basin_bwd:
@@ -545,47 +586,68 @@ def binding_simulator(
         free(y_k)
         return None, None
 
-    # Pad each leg to exactly `half` bins of in-basin diffusion
-    _pad_in_basin(leg_fwd, leg_len_fwd, half, saving_freq, Ax, Bx,
-                  force_spline, acc_force, rng)
-    _pad_in_basin(leg_bwd, leg_len_bwd, half, saving_freq, Ax, Bx,
-                  force_spline, acc_force, rng)
+    # Pad each leg to exactly `half` bins of in-basin diffusion. A confining-
+    # side spline escape during padding (-1 return) means the leg buffer is
+    # invalid; treat like any other shot failure and reject the trace.
+    cdef int pad_status
+    pad_status = _pad_in_basin(leg_fwd, leg_len_fwd, half, saving_freq, Ax, Bx,
+                               force_spline, acc_force, rng,
+                               x_min, x_max, open_left, open_right)
+    if pad_status == 0:
+        pad_status = _pad_in_basin(leg_bwd, leg_len_bwd, half, saving_freq, Ax, Bx,
+                                   force_spline, acc_force, rng,
+                                   x_min, x_max, open_left, open_right)
+    if pad_status != 0:
+        free(leg_fwd)
+        free(leg_bwd)
+        free(full)
+        _gsl_spline.gsl_spline_free(force_spline)
+        _gsl_spline.gsl_interp_accel_free(acc_force)
+        grn.gsl_rng_free(rng)
+        free(x_k)
+        free(y_k)
+        return None, None
 
-    # Concatenate legs into `full` so that basin A is on the left, basin B on
-    # the right, with the saddle crossing centered at index `half`.
+    # Concatenate legs into `full` so that basin B (larger-x, extended,
+    # low-FRET) is on the left and basin A (smaller-x, compact, high-FRET)
+    # is on the right, with the saddle crossing centered at index `half`.
+    # This orients the trace as a *binding* event in time: the molecule
+    # starts extended (donor-dominated) and ends compact (acceptor-
+    # dominated), matching the experimental direction of binding assays.
     cdef int idx
-    if basin_bwd == 0:
-        # backward leg committed to A → reverse it into the left half
+    if basin_bwd == 1:
+        # backward leg committed to B → reverse it into the left half
         for idx in range(half):
             full[idx] = leg_bwd[half - 1 - idx]
         for idx in range(half):
             full[half + idx] = leg_fwd[idx]
     else:
-        # forward leg committed to A → reverse it into the left half
+        # forward leg committed to B → reverse it into the left half
         for idx in range(half):
             full[idx] = leg_fwd[half - 1 - idx]
         for idx in range(half):
             full[half + idx] = leg_bwd[idx]
 
     # ─── Single-transition crop ───────────────────────────────────────────
-    # Locate the central crossing nearest `half`. _shoot_leg only guarantees
-    # the LAST k_persist bins of a leg are on the committed side, so the
-    # first bins of either leg may not yet straddle x_TS exactly at `half`.
+    # Locate the central crossing of r_mid nearest `half`. _shoot_leg only
+    # guarantees the LAST k_persist bins of a leg are on the committed side
+    # (under the kinetic x_TS criterion), so the first bins of either leg may
+    # not yet straddle r_mid exactly at `half`.
     cdef int t_idx = half
     cdef int offset = 0
     cdef int found = 0
     cdef int s_l, s_r
     while True:
         if half - offset - 1 >= 0 and half - offset < L_max_bins:
-            s_l = 0 if full[half - offset - 1] < x_TS_val else 1
-            s_r = 0 if full[half - offset]     < x_TS_val else 1
+            s_l = 0 if full[half - offset - 1] < r_mid else 1
+            s_r = 0 if full[half - offset]     < r_mid else 1
             if s_l != s_r:
                 t_idx = half - offset
                 found = 1
                 break
         if half + offset >= 0 and half + offset + 1 < L_max_bins:
-            s_l = 0 if full[half + offset]     < x_TS_val else 1
-            s_r = 0 if full[half + offset + 1] < x_TS_val else 1
+            s_l = 0 if full[half + offset]     < r_mid else 1
+            s_r = 0 if full[half + offset + 1] < r_mid else 1
             if s_l != s_r:
                 t_idx = half + offset + 1
                 found = 1
@@ -607,12 +669,14 @@ def binding_simulator(
         free(y_k)
         return None, None
 
-    # Walk outward from t_idx until the next *persistent* recrossing on each
-    # side. A recrossing counts only when k_persist consecutive bins land on
-    # the opposite side — single-bin diffusive blips across x_TS don't end
-    # the safe window. This mirrors the commitment criterion in _shoot_leg.
-    cdef int side_left  = 0 if full[t_idx - 1] < x_TS_val else 1
-    cdef int side_right = 0 if full[t_idx]     < x_TS_val else 1
+    # Walk outward from t_idx until the next *persistent* recrossing of r_mid
+    # on each side. A recrossing counts only when k_persist consecutive bins
+    # land on the opposite side of r_mid — single-bin diffusive blips don't
+    # end the safe window. This mirrors the commitment criterion in
+    # _shoot_leg, but applied to the FRET-midpoint threshold rather than the
+    # kinetic saddle.
+    cdef int side_left  = 0 if full[t_idx - 1] < r_mid else 1
+    cdef int side_right = 0 if full[t_idx]     < r_mid else 1
     cdef int s_cur
     cdef int other_run
 
@@ -620,7 +684,7 @@ def binding_simulator(
     cdef int j = t_idx - 1
     other_run = 0
     while j >= 0:
-        s_cur = 0 if full[j] < x_TS_val else 1
+        s_cur = 0 if full[j] < r_mid else 1
         if s_cur == side_left:
             other_run = 0
         else:
@@ -636,7 +700,7 @@ def binding_simulator(
     j = t_idx
     other_run = 0
     while j < L_max_bins:
-        s_cur = 0 if full[j] < x_TS_val else 1
+        s_cur = 0 if full[j] < r_mid else 1
         if s_cur == side_right:
             other_run = 0
         else:

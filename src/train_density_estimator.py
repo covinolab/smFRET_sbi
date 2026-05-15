@@ -42,22 +42,6 @@ from utils import (
 log = logging.getLogger(__name__)
 
 
-def _augment_with_mask(x, lengths):
-    """Append binary mask channel: 1=valid, 0=padded.
-
-    Handles both single-trace [batch, T, 2] and set-based [batch, N, T, 2] inputs.
-    """
-    if x.ndim == 4:
-        B, N, T, C = x.shape
-        x_flat = x.reshape(B * N, T, C)
-        lengths_flat = lengths.reshape(B * N)
-        mask = torch.arange(T, device=x.device).unsqueeze(0) < lengths_flat.unsqueeze(1)
-        x_flat = torch.cat([x_flat, mask.unsqueeze(-1).float()], dim=-1)
-        return x_flat.reshape(B, N, T, C + 1)
-    mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
-    return torch.cat([x, mask.unsqueeze(-1).float()], dim=-1)
-
-
 class _LossForward(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -68,12 +52,12 @@ class _LossForward(torch.nn.Module):
 
 
 def _unpack_batch(batch, device):
-    """Unpack a batch from the data loader, augmenting with mask channel if lengths present."""
-    if len(batch) == 3:
-        theta_batch, x_batch, lengths_batch = batch
-        x_batch = _augment_with_mask(x_batch, lengths_batch)
-    else:
-        theta_batch, x_batch = batch
+    """Unpack a batch from the data loader.
+
+    The loader yields `(theta, x)` where x has shape (..., N_max, 4) with
+    channels (log Δt, G_onehot, R_onehot, mask).
+    """
+    theta_batch, x_batch = batch
     return theta_batch.to(device, non_blocking=True), x_batch.to(device, non_blocking=True)
 
 
@@ -86,6 +70,7 @@ def _train_one_epoch(
     device,
     grad_clip,
     ddp,
+    aux_encoder=None,
 ):
     density_estimator.train()
     train_loss_sum = 0
@@ -98,8 +83,19 @@ def _train_one_epoch(
         optimizer.zero_grad()
         train_losses = loss_forward(theta_batch, x_batch)
         train_loss = train_losses.mean()
+        # Reported train loss is the *NPE* loss; aux contribution (if any)
+        # is added to the gradient only, not to the reported number.
         train_loss_sum += train_losses.sum().item()
         train_samples += theta_batch.size(0)
+        # FretSSM aux hook (begin) — adds Poisson next-photon NLL to the
+        # gradient when the encoder is FretSSM with aux_loss_weight > 0.
+        # No-op for any encoder without `last_aux_loss` (TCN, SSM).
+        if aux_encoder is not None:
+            aux_loss = getattr(aux_encoder, "last_aux_loss", None)
+            aux_weight = float(getattr(aux_encoder, "aux_loss_weight", 0.0))
+            if aux_loss is not None and aux_weight > 0:
+                train_loss = train_loss + aux_weight * aux_loss
+        # FretSSM aux hook (end)
         train_loss.backward()
         if grad_clip is not None and grad_clip > 0:
             grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
@@ -149,6 +145,10 @@ def _validate_one_epoch(density_estimator, val_loader, device, ddp):
 @hydra.main(version_base=None, config_path="../conf/training", config_name="density_estimator")
 def train(cfg: DictConfig) -> float:
     """Train the neural posterior estimator."""
+    # Enable TF32 matmuls on Ampere+ GPUs (≈ a few percent of float32 precision
+    # for a large speedup on dense layers). No-op on CPU and pre-Ampere GPUs.
+    torch.set_float32_matmul_precision('high')
+
     ddp = setup_ddp()
     device = get_device()
     training_seed = int(getattr(cfg.training, "seed", 42))
@@ -183,18 +183,25 @@ def train(cfg: DictConfig) -> float:
     # Get dataset info and init samples
     temp_dataset = H5Dataset(h5_path)
     num_examples = len(temp_dataset)
-    has_lengths = temp_dataset.has_lengths
 
-    if has_lengths:
-        theta_init, x_init, lengths_init = temp_dataset[:100]
-        x_init = _augment_with_mask(x_init, lengths_init)
-        transition_dim = 3
-        log.info("Binding mode detected (variable-length traces with mask channel)")
-    else:
-        theta_init, x_init = temp_dataset[:100]
-        transition_dim = 2
+    theta_init, x_init = temp_dataset[:100]
+    # x channels: (log Δt, G_onehot, R_onehot, mask) → transition_dim = 4
+    transition_dim = 4
+    log.info("Per-photon-events mode (x channels: log_dt, G_oh, R_oh, mask)")
 
     num_traces_per_set = int(getattr(cfg.data, "num_traces_per_set", 1))
+
+    # Assert the config matches the actual data shape — otherwise the encoder
+    # is built for the wrong rank and conv1d explodes deep in the stack.
+    data_is_set_mode = (x_init.ndim == 4)
+    data_num_traces_per_set = int(x_init.shape[1]) if data_is_set_mode else 1
+    if data_num_traces_per_set != num_traces_per_set:
+        raise ValueError(
+            f"cfg.data.num_traces_per_set={num_traces_per_set} does not match the "
+            f"actual data (shape {tuple(x_init.shape)} → num_traces_per_set="
+            f"{data_num_traces_per_set}). Fix the training config to match the "
+            f"generated dataset."
+        )
 
     if num_traces_per_set > 1:
         max_len = x_init.shape[2]
@@ -220,6 +227,13 @@ def train(cfg: DictConfig) -> float:
             transition_dim=transition_dim,
             max_len=max_len
         )
+
+    # FretSSM aux hook (begin) — find the inner per-trace encoder for L6
+    # aux-loss readout. Set-mode wraps the encoder in SetEmbedding(.encoder);
+    # non-set returns the encoder directly. Non-FretSSM encoders just don't
+    # have `last_aux_loss`, so the hook downstream is a no-op for them.
+    _aux_encoder = getattr(encoder, "encoder", encoder)
+    # FretSSM aux hook (end)
 
     # Build normalizing flow
     neural_posterior = posterior_nn(
@@ -415,6 +429,7 @@ def train(cfg: DictConfig) -> float:
         train_loss_avg, train_samples_total, clip_fraction = _train_one_epoch(
             loss_forward, density_estimator, train_loader, optimizer, scheduler,
             device, grad_clip, ddp,
+            aux_encoder=_aux_encoder,   # FretSSM aux hook
         )
         val_loss = _validate_one_epoch(density_estimator, val_loader, device, ddp)
 

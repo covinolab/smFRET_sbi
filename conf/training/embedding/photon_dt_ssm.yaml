@@ -1,0 +1,11 @@
+name: photon_dt_ssm
+hidden_dim: 64
+num_blocks: 2
+output_dim: 128
+bidirectional: true
+# α initialised log-spaced over [1e-3, 1e2] ms (1 μs → 100 ms) so the bank
+# of exponential timescales spans μs fast transitions and ms dwells.
+alpha_init_range_ms: [1.0e-3, 1.0e+2]
+# Square-root chunk size keeps the chunked scan's sequential depth at ~2√N
+# for typical traces (N=16384 → K=128 is also a reasonable choice).
+chunk_size: 64

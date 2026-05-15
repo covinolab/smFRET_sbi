@@ -23,13 +23,19 @@ import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from sbi.inference.posteriors import DirectPosterior
+from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = SCRIPT_DIR.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.append(str(SRC_DIR))
 
-from priors import generate_fret_prior_from_config, generate_posterior_prior_from_config  # noqa: E402
+from priors import (  # noqa: E402
+    generate_fret_prior_from_config,
+    generate_posterior_prior_from_config,
+    generate_split_priors_from_config,
+    assemble_canonical_theta,
+)
 from simulator import binding_simulator_wrapper_from_config  # noqa: E402
 from utils import map_with_cached_embedding  # noqa: E402
 
@@ -48,52 +54,82 @@ def get_trajectory_data(traj_file):
 
 
 def photons_to_model_input(interphoton_times, macro_time_unit_ps, detector,
-                           sim_bin_width_ms, L_max_bins):
-    """Bin photon arrivals at simulator resolution, return (L_max_bins, 3) tensor."""
-    bin_width_ps = np.int64(sim_bin_width_ms * 1e9)
+                           N_max_photons, sim_bin_width_ms=None, L_max_bins=None):
+    """Convert raw photon stream to PhotonTCN-ready `x` tensor.
+
+    `sim_bin_width_ms` and `L_max_bins` are kept as kw-args for backward
+    compatibility with old call sites but are unused now — the network
+    consumes per-photon arrival times directly.
+
+    Returns
+    -------
+    x : torch.Tensor, shape (N_max_photons, 4), float32
+        Channels: (log(Δt + ε), G_onehot, R_onehot, mask). Padded with zeros.
+    n_valid : int
+        Number of real photons (≤ N_max_photons).
+    """
     macro_time_unit_ps = np.int64(macro_time_unit_ps)
+    n_total = int(interphoton_times.shape[0])
+    if n_total == 0:
+        return torch.zeros(N_max_photons, 4, dtype=torch.float32), 0
 
-    interphoton_times_ps = interphoton_times.astype(np.int64) * macro_time_unit_ps
-    photon_times_ps = np.cumsum(interphoton_times_ps, dtype=np.int64)
+    # Δt in MILLISECONDS — matches the simulator's time convention (the project
+    # uses ms throughout; see setup_prior.ipynb cell 31, "All times in ms").
+    # Experimental files store Δt as macrotime units × MacroTimeUnitInPicoseconds:
+    #   ps → ms = × 1e-9.
+    ipt_ms = interphoton_times.astype(np.int64) * macro_time_unit_ps * 1e-9
+    # Channels: G=0 (DONOR), R=1 (ACCEPTOR). Keep the same convention as the simulator.
+    chans = (detector == ACCEPTOR_ID).astype(np.uint8)
 
-    total_time_ps = photon_times_ps[-1]
-    n_bins = max(1, int(np.ceil(total_time_ps / bin_width_ps)))
+    # Truncate or pad to N_max_photons.
+    n_valid = min(n_total, N_max_photons)
+    ipt_padded = np.zeros(N_max_photons, dtype=np.float32)
+    chans_padded = np.zeros(N_max_photons, dtype=np.uint8)
+    ipt_padded[:n_valid] = ipt_ms[:n_valid].astype(np.float32)
+    chans_padded[:n_valid] = chans[:n_valid]
+    # First interphoton time is 0 by convention (matches simulator output).
+    if n_valid > 0:
+        ipt_padded[0] = 0.0
 
-    n_valid = min(n_bins, L_max_bins)
-    bin_edges = np.linspace(0, n_valid * bin_width_ps, n_valid + 1)
-
-    donor_counts, _ = np.histogram(photon_times_ps[detector == DONOR_ID], bins=bin_edges)
-    acceptor_counts, _ = np.histogram(photon_times_ps[detector == ACCEPTOR_ID], bins=bin_edges)
-
-    out = torch.zeros(L_max_bins, 3, dtype=torch.float32)
-    out[:n_valid, 0] = torch.from_numpy(donor_counts.astype(np.float32))
-    out[:n_valid, 1] = torch.from_numpy(acceptor_counts.astype(np.float32))
-    out[:n_valid, 2] = 1.0
-    return out, n_valid
+    # Build features the same way the H5Dataset loader does for sim data
+    # (see data_loaders.H5Dataset._arrivals_to_x). Channels: log Δt, G_oh, R_oh, mask.
+    LOG_IPT_EPS = np.float32(1e-12)
+    log_ipt = np.log(ipt_padded + LOG_IPT_EPS)
+    g_oh = (chans_padded == 0).astype(np.float32)
+    r_oh = (chans_padded == 1).astype(np.float32)
+    idx = np.arange(N_max_photons, dtype=np.int64)
+    mask_bool = idx < n_valid
+    mask_f = mask_bool.astype(np.float32)
+    log_ipt = log_ipt * mask_f
+    g_oh = g_oh * mask_f
+    r_oh = r_oh * mask_f
+    x = np.stack([log_ipt, g_oh, r_oh, mask_f], axis=-1)
+    return torch.from_numpy(x), int(n_valid)
 
 
 def list_condition_trace_files(data_root: Path, condition_name: str) -> list[Path]:
     return sorted((data_root / condition_name).glob("*.h5"))
 
 
-def load_all_condition_traces(trace_files, sim_bin_width_ms, L_max_bins):
+def load_all_condition_traces(trace_files, N_max_photons):
     """Load every trajectory for one condition into model-input tensors.
 
-    Returns (tensors, valid_bins, kept_paths) — traces with 0 valid bins are dropped.
+    Returns (tensors, valid_lens, kept_paths) — traces with 0 photons are dropped.
+    Each tensor has shape (N_max_photons, 4) — see `photons_to_model_input`.
     """
-    tensors, valid_bins, kept = [], [], []
+    tensors, valid_lens, kept = [], [], []
     for f in trace_files:
         try:
             ipt, mtu, det = get_trajectory_data(f)
         except (OSError, KeyError) as err:
             print(f"  [skip] {f.name}: {err}")
             continue
-        tensor, n_valid = photons_to_model_input(ipt, mtu, det, sim_bin_width_ms, L_max_bins)
+        tensor, n_valid = photons_to_model_input(ipt, mtu, det, N_max_photons=N_max_photons)
         if n_valid > 0:
             tensors.append(tensor)
-            valid_bins.append(n_valid)
+            valid_lens.append(n_valid)
             kept.append(f)
-    return tensors, valid_bins, kept
+    return tensors, valid_lens, kept
 
 
 def bootstrap_indices(n_pool: int, n_draw: int, rng: np.random.Generator) -> np.ndarray:
@@ -105,7 +141,7 @@ def build_observation(tensors, indices, device):
     return stacked.unsqueeze(0).to(device)                      # (1, n_obs, L, 3)
 
 
-def simulate_ppc_trajectories(simulate, fret_prior, map_theta, num_knots,
+def simulate_ppc_trajectories(simulate, fret_prior, map_theta, inferred_idx,
                               num_trajectories, L_max_bins, max_retries):
     """Simulate PPC trajectories from MAP with photophysics drawn from fret_prior."""
     sim_tensors, sim_valid = [], []
@@ -113,11 +149,8 @@ def simulate_ppc_trajectories(simulate, fret_prior, map_theta, num_knots,
     max_attempts = num_trajectories * max_retries
     while len(sim_tensors) < num_trajectories and attempts < max_attempts:
         attempts += 1
-        nuisance = fret_prior.sample((1,)).squeeze()
-        params_16 = nuisance.clone()
-        params_16[0] = map_theta[0]
-        params_16[1:num_knots + 1] = map_theta[1:-1]
-        params_16[num_knots + 1] = map_theta[-1]
+        params_16 = fret_prior.sample((1,)).squeeze().clone()
+        params_16[inferred_idx] = map_theta
 
         result = simulate(params_16)
         if result is None:
@@ -134,17 +167,36 @@ def simulate_ppc_trajectories(simulate, fret_prior, map_theta, num_knots,
     return sim_tensors, sim_valid
 
 
+def batched_log_prob(posterior, samples, obs, batch_size, device):
+    """Evaluate posterior log-probability of `samples` in chunks of `batch_size`."""
+    samples_dev = samples.to(device)
+    log_probs = []
+    with torch.no_grad():
+        for start in tqdm(
+            range(0, samples_dev.shape[0], batch_size), desc="log_prob batches"
+        ):
+            chunk = samples_dev[start:start + batch_size]
+            log_probs.append(posterior.log_prob(chunk, x=obs).cpu())
+    return torch.cat(log_probs)
+
+
 def save_round_artifacts(
     out_dir: Path,
     posterior_samples: torch.Tensor,
+    log_probs: torch.Tensor,
+    top_idx: torch.Tensor,
     map_estimate: torch.Tensor,
+    map_log_prob: float,
     ppc_tensor: torch.Tensor,
     ppc_valid_bins: torch.Tensor,
     trace_manifest: dict,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(posterior_samples, out_dir / "posterior_samples.pt")
+    torch.save(log_probs, out_dir / "posterior_log_probs.pt")
+    torch.save(top_idx, out_dir / "top_idx.pt")
     torch.save(map_estimate, out_dir / "map_estimate.pt")
+    torch.save(torch.tensor(map_log_prob), out_dir / "map_log_prob.pt")
     torch.save(ppc_tensor, out_dir / "ppc_trajectories.pt")
     torch.save(ppc_valid_bins, out_dir / "ppc_valid_bins.pt")
     with open(out_dir / "trace_manifest.json", "w") as f:
@@ -163,7 +215,10 @@ def main(cfg: DictConfig) -> None:
     data_cfg_path = str(cfg.model.data_config_path)
     data_cfg = OmegaConf.load(data_cfg_path)
     num_knots = data_cfg.prior.num_knots
-    theta_dim = num_knots + 2
+    prior_posterior, _, inferred_idx, _ = generate_split_priors_from_config(
+        data_cfg_path, device=device
+    )
+    theta_dim = int(inferred_idx.numel())
     sim_bin_width_ms = data_cfg.simulator.time_step * data_cfg.simulator.saving_frequency
     L_max_bins = data_cfg.simulator.binding.L_max_bins
     print(f"[runner] model expects (n_obs, {L_max_bins}, 3) @ {sim_bin_width_ms} ms bins; theta_dim={theta_dim}")
@@ -181,7 +236,6 @@ def main(cfg: DictConfig) -> None:
     density_estimator = density_estimator.to(device)
     density_estimator.eval()
 
-    prior_posterior = generate_posterior_prior_from_config(data_cfg_path, device=device)
     fret_prior = generate_fret_prior_from_config(data_cfg_path, device="cpu")
     simulate = binding_simulator_wrapper_from_config(data_cfg_path)
     posterior = DirectPosterior(density_estimator, prior=prior_posterior)
@@ -258,15 +312,27 @@ def main(cfg: DictConfig) -> None:
                 max_sampling_batch_size=int(cfg.inference.posterior_batch_size),
             ).cpu()
 
+            log_probs = batched_log_prob(
+                posterior,
+                samples,
+                obs,
+                batch_size=int(cfg.inference.log_prob_batch_size),
+                device=device,
+            )
+            top_k = int(cfg.inference.map_num_init_samples)
+            top_log_probs, top_idx = torch.topk(log_probs, k=top_k)
+            top_samples = samples[top_idx]
+
             map_theta, map_log_prob = map_with_cached_embedding(
                 density_estimator,
                 prior_posterior,
                 obs,
                 num_iter=int(cfg.inference.map_num_iter),
-                num_init_samples=int(cfg.inference.map_num_init_samples) * 100,
-                num_to_optimize=int(cfg.inference.map_num_init_samples),
+                num_init_samples=top_k,
+                num_to_optimize=top_k,
                 learning_rate=float(cfg.inference.map_learning_rate),
-                init_samples=samples,
+                init_samples=top_samples,
+                show_progress_bars=True,
             )
             print(f"[round]   MAP = {map_theta.numpy().round(3)}  log p = {map_log_prob:.2f}")
 
@@ -274,7 +340,7 @@ def main(cfg: DictConfig) -> None:
                 simulate,
                 fret_prior,
                 map_theta,
-                num_knots=num_knots,
+                inferred_idx=inferred_idx,
                 num_trajectories=int(cfg.ppc.num_trajectories),
                 L_max_bins=L_max_bins,
                 max_retries=int(cfg.ppc.max_retries_per_trace),
@@ -296,7 +362,10 @@ def main(cfg: DictConfig) -> None:
             save_round_artifacts(
                 round_dir,
                 posterior_samples=samples,
+                log_probs=log_probs,
+                top_idx=top_idx,
                 map_estimate=map_theta,
+                map_log_prob=float(map_log_prob),
                 ppc_tensor=ppc_tensor,
                 ppc_valid_bins=ppc_valid,
                 trace_manifest=trace_manifest,

@@ -45,9 +45,12 @@ simulator:
   binding:
     L_min_bins: 200              # smallest truncated window length, in saved bins
     L_max_bins: 400              # largest truncated window length and total two-sided shoot length
-    k_persist: 20                # consecutive bins inside a basin to declare commitment
-    landmark_grid_n: 400         # grid size for locating x_A, x_B, x_TS from U(x)
     N_max: 200000000             # per-leg raw-step safety guard
+    epsilon: 0.05                # committor basin half-width: A={q<eps}, B={q>1-eps}
+    max_shoot_attempts: 100      # per-leg retry budget inside one trace
+    max_traj_retries: 5          # outer retry-on-None budget in the wrapper
+    center_jitter_frac: 0.10     # crop center jitter as fraction of crop_half
+    n_committor_grid: 4000       # committor / U(x) BVP grid resolution
 
 
 data_generation:

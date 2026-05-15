@@ -12,6 +12,9 @@ cdef extern from "gsl/gsl_rng.h":
 
     gsl_rng_type * gsl_rng_env_setup () nogil
 
+    double gsl_rng_uniform( gsl_rng * r) nogil
+    unsigned long int gsl_rng_uniform_int( gsl_rng * r, unsigned long int n) nogil
+
 
 
 cdef extern from "gsl/gsl_randist.h":

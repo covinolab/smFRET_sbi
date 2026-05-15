@@ -16,10 +16,11 @@ rounds:
 
 inference:
   num_posterior_samples: 10000
-  posterior_batch_size: 500
-  map_num_iter: 500
+  posterior_batch_size: 1000
+  log_prob_batch_size: 30
+  map_num_iter: 5000
   map_learning_rate: 0.01
-  map_num_init_samples: 10
+  map_num_init_samples: 50  # = top-k posterior samples used as MAP inits
 
 ppc:
   num_trajectories: 1000

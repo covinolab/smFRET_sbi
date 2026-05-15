@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 from simulator import smFRET_simulator_wrapper as fret_simulator
 from simulator import binding_simulator_wrapper as binding_simulator
 from priors import (
-    generate_posterior_prior_from_config,
-    generate_nuisance_prior_from_config,
+    generate_split_priors_from_config,
+    assemble_canonical_theta,
 )
 from utils import _validate_bc
 
@@ -31,21 +31,25 @@ from utils import _validate_bc
 _worker_sim_fn = None
 _worker_nuisance_prior = None
 _worker_out_queue = None
-_worker_has_lengths = False
 _worker_num_traces = 1
 _worker_max_traj_retries = 50
+_worker_inferred_idx = None
+_worker_nuisance_idx = None
 
 
-def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior, has_lengths,
-                 num_traces=1, max_traj_retries=1):
+def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior,
+                 num_traces=1, max_traj_retries=1,
+                 inferred_idx=None, nuisance_idx=None):
     """Initialise per-worker shared state (called once per pool worker)."""
     global _worker_sim_fn, _worker_nuisance_prior, _worker_out_queue
-    global _worker_has_lengths, _worker_num_traces, _worker_max_traj_retries
+    global _worker_num_traces, _worker_max_traj_retries
+    global _worker_inferred_idx, _worker_nuisance_idx
     _worker_nuisance_prior = nuisance_prior
     _worker_out_queue = out_queue
-    _worker_has_lengths = has_lengths
     _worker_num_traces = num_traces
     _worker_max_traj_retries = max_traj_retries
+    _worker_inferred_idx = inferred_idx
+    _worker_nuisance_idx = nuisance_idx
     _worker_sim_fn = partial(sim_fn, **sim_kwargs)
     np.random.seed(os.getpid() % (2**32))
     torch.set_num_threads(1)
@@ -54,55 +58,59 @@ def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior, has_lengths,
 def _worker_simulate_batch(batch_theta):
     """Simulate a batch, push results to the writer queue, return success count.
 
-    Each trace draws its own fresh nuisance sample. Within a set, the inferred
-    portion (``batch_theta[i]``) is shared across all N traces, while nuisance
-    is independent per trace — matching how real single-molecule experiments
-    produce multiple molecules under one physical condition.
+    Each simulator call returns (interphoton_times, channels, length) padded
+    to N_max_photons. For set-based mode (num_traces_per_set > 1), each
+    "simulation" stacks N traces; the inferred portion is shared across the
+    set while nuisance is resampled per trace.
     """
-    results_theta, results_x, results_lengths = [], [], []
+    results_theta, results_ipt, results_chans, results_lengths = [], [], [], []
     N = _worker_num_traces
 
     for i in range(len(batch_theta)):
-        traces, lengths = [], []
+        ipt_set, chans_set, lengths_set = [], [], []
         ok = True
         for _ in range(N):
             result = None
             for _attempt in range(_worker_max_traj_retries):
                 nuisance = _worker_nuisance_prior.sample((1,)).squeeze(0)
-                theta_for_sim = torch.cat([batch_theta[i], nuisance])
+                theta_for_sim = assemble_canonical_theta(
+                    batch_theta[i], nuisance,
+                    _worker_inferred_idx, _worker_nuisance_idx,
+                )
                 result = _worker_sim_fn(theta_for_sim)
                 if result is not None:
                     break
             if result is None:
                 ok = False
                 break
-            if _worker_has_lengths:
-                trace, length = result
-                traces.append(trace)
-                lengths.append(length)
-            else:
-                traces.append(result)
+            ipt, chans, length = result
+            ipt_set.append(ipt)
+            chans_set.append(chans)
+            lengths_set.append(length)
         if not ok:
             continue
 
         if N > 1:
-            results_x.append(np.stack(traces, axis=0))
-            if _worker_has_lengths:
-                results_lengths.append(np.array(lengths, dtype=np.int32))
+            results_ipt.append(np.stack(ipt_set, axis=0))
+            results_chans.append(np.stack(chans_set, axis=0))
+            results_lengths.append(np.array(lengths_set, dtype=np.int32))
         else:
-            results_x.append(traces[0])
-            if _worker_has_lengths:
-                results_lengths.append(lengths[0])
+            results_ipt.append(ipt_set[0])
+            results_chans.append(chans_set[0])
+            results_lengths.append(lengths_set[0])
         results_theta.append(batch_theta[i].numpy())
 
     if not results_theta:
         return 0
 
-    thetas, xs = np.stack(results_theta), np.stack(results_x)
-    if _worker_has_lengths:
-        payload = (thetas, xs, np.array(results_lengths, dtype=np.int32))
+    thetas = np.stack(results_theta)
+    ipts = np.stack(results_ipt)
+    chans_arr = np.stack(results_chans)
+    if N > 1:
+        lengths_arr = np.stack(results_lengths)
     else:
-        payload = (thetas, xs)
+        lengths_arr = np.array(results_lengths, dtype=np.int32)
+    payload = (thetas, ipts, chans_arr, lengths_arr)
     while True:
         try:
             _worker_out_queue.put(payload, timeout=30)
@@ -114,12 +122,28 @@ def _worker_simulate_batch(batch_theta):
 
 # ── HDF5 writer process ────────────────────────────────────────────────────
 
-def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
-                    in_queue, done_queue, written_counter, has_lengths=False,
-                    lengths_shape=()):
-    """Dedicated writer process: drains the queue and appends batches to HDF5."""
+def _writer_process(h5_path, num_simulations, theta_dim, n_max_photons,
+                    chunk_size, in_queue, done_queue, written_counter,
+                    num_traces_per_set=1):
+    """Dedicated writer process: drains the queue and appends batches to HDF5.
+
+    Schema (v2, per-photon events):
+        /theta              float32  [N, theta_dim]
+        /interphoton_times  float32  [N, N_max] or [N, num_traces_per_set, N_max]
+        /channels           uint8    same trailing shape as interphoton_times
+        /lengths            int32    [N] or [N, num_traces_per_set]
+    """
+    if num_traces_per_set > 1:
+        events_shape = (num_traces_per_set, n_max_photons)
+        lengths_shape = (num_traces_per_set,)
+    else:
+        events_shape = (n_max_photons,)
+        lengths_shape = ()
+
     theta_chunks = (max(1, min(chunk_size, num_simulations)), theta_dim)
-    x_chunks = (max(1, min(chunk_size, num_simulations)),) + x_shape
+    events_chunks = (max(1, min(chunk_size, num_simulations)),) + events_shape
+    full_lengths_shape = (num_simulations,) + lengths_shape
+    lengths_chunks = (max(1, min(chunk_size, num_simulations)),) + lengths_shape
     idx = 0
 
     with h5py.File(h5_path, "w", libver="latest") as f:
@@ -132,58 +156,58 @@ def _writer_process(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
             compression="gzip", compression_opts=1, shuffle=True,
         )
         f.create_dataset(
-            "x",
-            shape=(num_simulations,) + x_shape,
-            maxshape=(num_simulations,) + x_shape,
+            "interphoton_times",
+            shape=(num_simulations,) + events_shape,
+            maxshape=(num_simulations,) + events_shape,
             dtype="float32",
-            chunks=x_chunks,
+            chunks=events_chunks,
             compression="gzip", compression_opts=1, shuffle=True,
         )
-        if has_lengths:
-            full_lengths_shape = (num_simulations,) + lengths_shape
-            lengths_chunks = (max(1, min(chunk_size, num_simulations)),) + lengths_shape
-            f.create_dataset(
-                "lengths",
-                shape=full_lengths_shape,
-                maxshape=full_lengths_shape,
-                dtype="int32",
-                chunks=lengths_chunks,
-                compression="gzip", compression_opts=1,
-            )
+        f.create_dataset(
+            "channels",
+            shape=(num_simulations,) + events_shape,
+            maxshape=(num_simulations,) + events_shape,
+            dtype="uint8",
+            chunks=events_chunks,
+            compression="gzip", compression_opts=1, shuffle=True,
+        )
+        f.create_dataset(
+            "lengths",
+            shape=full_lengths_shape,
+            maxshape=full_lengths_shape,
+            dtype="int32",
+            chunks=lengths_chunks,
+            compression="gzip", compression_opts=1,
+        )
 
         while True:
             item = in_queue.get()
             if item is None:
                 break
 
-            if has_lengths:
-                theta_np, x_np, lengths_np = item
-            else:
-                theta_np, x_np = item
+            theta_np, ipts_np, chans_np, lengths_np = item
             n = theta_np.shape[0]
 
             f["theta"][idx : idx + n] = theta_np
-            f["x"][idx : idx + n] = x_np
-            if has_lengths:
-                f["lengths"][idx : idx + n] = lengths_np
+            f["interphoton_times"][idx : idx + n] = ipts_np
+            f["channels"][idx : idx + n] = chans_np
+            f["lengths"][idx : idx + n] = lengths_np
             idx += n
             with written_counter.get_lock():
                 written_counter.value = idx
 
         # Trim if some simulations returned None
         if idx < num_simulations:
-            f["theta"].resize(idx, axis=0)
-            f["x"].resize(idx, axis=0)
-            if has_lengths:
-                f["lengths"].resize(idx, axis=0)
+            for ds_name in ("theta", "interphoton_times", "channels", "lengths"):
+                f[ds_name].resize(idx, axis=0)
 
+        f.attrs["schema_version"] = 2
         f.attrs["write_idx"] = idx
         f.attrs["num_simulations"] = idx
+        f.attrs["n_max_photons"] = n_max_photons
+        f.attrs["num_traces_per_set"] = num_traces_per_set
         f.attrs["generated_at"] = datetime.now().isoformat()
         f.attrs["theta_shape"] = list(f["theta"].shape)
-        f.attrs["x_shape"] = list(f["x"].shape)
-        if has_lengths:
-            f.attrs["has_lengths"] = True
 
     done_queue.put(idx)
 
@@ -215,27 +239,36 @@ def parse_args():
 
 # ── Simulation orchestration ───────────────────────────────────────────────
 
-def _determine_output_shape(sim_fn, sim_kwargs, prior, nuisance_prior,
-                            has_lengths=False,
-                            num_traces_per_set=1, max_attempts=100):
-    """Run test simulations to discover the observation tensor shape."""
+def _validate_simulator_returns_events(sim_fn, sim_kwargs, prior, nuisance_prior,
+                                       inferred_idx, nuisance_idx,
+                                       n_max_photons, max_attempts=100):
+    """Sanity-check that the simulator returns a (ipt, channels, length) tuple
+    with the expected shapes. Returns once a single successful simulation is
+    observed; raises if `max_attempts` fail.
+    """
     fn = partial(sim_fn, **sim_kwargs)
     for _ in range(max_attempts):
         inferred = prior.sample((1,)).squeeze(0)
         nuisance = nuisance_prior.sample((1,)).squeeze(0)
-        theta = torch.cat([inferred, nuisance])
+        theta = assemble_canonical_theta(inferred, nuisance, inferred_idx, nuisance_idx)
         result = fn(theta)
-        if result is not None:
-            if has_lengths:
-                trace, _ = result
-                single_shape = tuple(trace.shape)
-            else:
-                single_shape = tuple(result.shape)
-            if num_traces_per_set > 1:
-                return (num_traces_per_set,) + single_shape
-            return single_shape
+        if result is None:
+            continue
+        if not (isinstance(result, tuple) and len(result) == 3):
+            raise RuntimeError(
+                "Simulator must return (interphoton_times, channels, length); "
+                f"got {type(result).__name__} of length "
+                f"{len(result) if hasattr(result, '__len__') else 'N/A'}"
+            )
+        ipt, chans, length = result
+        if ipt.shape != (n_max_photons,) or chans.shape != (n_max_photons,):
+            raise RuntimeError(
+                f"Simulator returned shapes ipt={ipt.shape}, chans={chans.shape}; "
+                f"expected ({n_max_photons},) for both."
+            )
+        return
     raise RuntimeError(
-        f"Could not determine output shape after {max_attempts} test simulations"
+        f"Could not get a successful simulation after {max_attempts} attempts"
     )
 
 
@@ -251,15 +284,16 @@ def _prepare_output_dir(output_dir_arg, cfg_output_dir, use_timestamp):
 def _run_simulation_pool(prior, nuisance_prior, batch_size, num_workers,
                          out_queue, sim_fn, sim_kwargs, num_simulations,
                          written_counter, writer_process=None,
-                         has_lengths=False,
                          num_traces_per_set=1, max_traj_retries=1,
-                         max_rounds=500):
+                         max_rounds=500,
+                         inferred_idx=None, nuisance_idx=None):
     """Run the worker pool, retrying until the simulation budget is met."""
     pool = mp.Pool(
         num_workers,
         initializer=_init_worker,
-        initargs=(out_queue, sim_fn, sim_kwargs, nuisance_prior, has_lengths,
-                  num_traces_per_set, max_traj_retries),
+        initargs=(out_queue, sim_fn, sim_kwargs, nuisance_prior,
+                  num_traces_per_set, max_traj_retries,
+                  inferred_idx, nuisance_idx),
     )
     total_simulated = 0
     round_num = 0
@@ -319,21 +353,22 @@ def generate_simulations(cfg, args):
     num_workers = args.num_workers
     batch_size = cfg.data_generation.batch_size
     chunk_size = args.chunk_size or cfg.data_generation.chunk_size
-    theta_dim = cfg.prior.num_knots + 2
 
     num_traces_per_set = int(cfg.data_generation.get("num_traces_per_set", 1))
     max_traj_retries = int(cfg.data_generation.get("max_traj_retries", 1))
+    n_max_photons = int(cfg.simulator.N_max_photons)
 
-    prior = generate_posterior_prior_from_config(cfg, device="cpu")
-    nuisance_prior = generate_nuisance_prior_from_config(cfg, device="cpu")
+    prior, nuisance_prior, inferred_idx, nuisance_idx = (
+        generate_split_priors_from_config(cfg, device="cpu")
+    )
+    theta_dim = int(inferred_idx.numel())
 
     # Mode dispatch — build sim_fn and sim_kwargs
     mode = str(cfg.simulator.get("mode", "equilibrium")).lower()
-    has_lengths = (mode == "binding")
     bc = _validate_bc(cfg.simulator.boundary_condition, allow_open=(mode == "binding"))
     sim_kwargs = dict(
         dt=cfg.simulator.time_step,
-        saving_freq=cfg.simulator.saving_frequency,
+        N_max_photons=n_max_photons,
         x_min=cfg.simulator.x_min,
         x_max=cfg.simulator.x_max,
         num_knots=cfg.prior.num_knots,
@@ -345,23 +380,26 @@ def generate_simulations(cfg, args):
     if mode == "binding":
         binding_cfg = cfg.simulator.binding
         sim_kwargs.update(
+            saving_freq=cfg.simulator.saving_frequency,
             L_min_bins=binding_cfg.L_min_bins,
             L_max_bins=binding_cfg.L_max_bins,
-            k_persist=binding_cfg.k_persist,
-            landmark_grid_n=binding_cfg.get("landmark_grid_n", 400),
+            epsilon=binding_cfg.get("epsilon", 0.05),
             N_max=binding_cfg.get("N_max", 200000000),
+            max_shoot_attempts=binding_cfg.get("max_shoot_attempts", 100),
+            center_jitter_frac=binding_cfg.get("center_jitter_frac", 0.10),
+            n_committor_grid=binding_cfg.get("n_committor_grid", 4000),
             open_left=int(bc[0] == "open"),
             open_right=int(bc[1] == "open"),
         )
         sim_fn = binding_simulator
-        print("Mode: binding (h-transform, variable-length traces)")
+        print("Mode: binding (per-photon arrival times)")
     else:
         sim_kwargs.update(
             T=cfg.simulator.total_time,
             x_init=tuple(cfg.simulator.x_init),
         )
         sim_fn = fret_simulator
-        print("Mode: equilibrium (fixed-length traces)")
+        print("Mode: equilibrium (per-photon arrival times)")
 
     if num_traces_per_set > 1:
         print(f"Set-based mode: {num_traces_per_set} traces per set "
@@ -369,32 +407,33 @@ def generate_simulations(cfg, args):
     if max_traj_retries > 1:
         print(f"Per-trajectory retries: {max_traj_retries}")
 
-    # Discover observation shape
-    print("Running test simulation to determine output shape...")
-    x_shape = _determine_output_shape(sim_fn, sim_kwargs, prior, nuisance_prior,
-                                      has_lengths=has_lengths,
-                                      num_traces_per_set=num_traces_per_set)
-    print(f"  theta dim: {theta_dim}, observation shape: {x_shape}")
+    # Sanity-check the simulator returns the expected (ipt, channels, length).
+    print("Running test simulation to validate output format...")
+    _validate_simulator_returns_events(
+        sim_fn, sim_kwargs, prior, nuisance_prior,
+        inferred_idx, nuisance_idx, n_max_photons,
+    )
+    print(f"  theta dim: {theta_dim}, N_max_photons: {n_max_photons}")
 
     # Prepare output
     output_dir = _prepare_output_dir(args.output_dir, cfg.output.directory, args.timestamp)
     h5_path = str(output_dir / "data.h5")
 
-    batch_x_mb = int(np.prod(x_shape)) * 4 * batch_size / (1024 ** 2)
+    set_dim = num_traces_per_set if num_traces_per_set > 1 else 1
+    batch_x_mb = (n_max_photons * set_dim * (4 + 1)) * batch_size / (1024 ** 2)
     print(f"Starting {num_simulations} simulations with {num_workers} workers "
           f"(batch_size={batch_size})...")
-    print(f"  x_shape={x_shape}, per-batch result size ~{batch_x_mb:.1f} MB", flush=True)
+    print(f"  per-batch result size ~{batch_x_mb:.1f} MB (events+channels)", flush=True)
 
     # Start dedicated writer process
     out_queue = mp.Queue(maxsize=2 * num_workers)
     done_queue = mp.Queue(maxsize=1)
     written_counter = mp.Value('i', 0)
-    lengths_shape = (num_traces_per_set,) if (has_lengths and num_traces_per_set > 1) else ()
     writer = mp.Process(
         target=_writer_process,
-        args=(h5_path, num_simulations, theta_dim, x_shape, chunk_size,
+        args=(h5_path, num_simulations, theta_dim, n_max_photons, chunk_size,
               out_queue, done_queue, written_counter),
-        kwargs=dict(has_lengths=has_lengths, lengths_shape=lengths_shape),
+        kwargs=dict(num_traces_per_set=num_traces_per_set),
         daemon=False,
     )
     writer.start()
@@ -403,9 +442,9 @@ def generate_simulations(cfg, args):
     _, sim_bar, write_bar = _run_simulation_pool(
         prior, nuisance_prior, batch_size, num_workers, out_queue, sim_fn,
         sim_kwargs, num_simulations, written_counter, writer_process=writer,
-        has_lengths=has_lengths,
         num_traces_per_set=num_traces_per_set,
         max_traj_retries=max_traj_retries,
+        inferred_idx=inferred_idx, nuisance_idx=nuisance_idx,
     )
 
     # Signal writer to finish

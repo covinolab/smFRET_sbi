@@ -1,6 +1,6 @@
 
 defaults:
-  - embedding: cnn
+  - embedding: photon_tcn
   - _self_
 
 training:
@@ -23,11 +23,9 @@ scheduler:
   final_div_factor: 1e4
 
 embedding:
-  dim: 8
-  dim_mults: [1, 2]
-  attention: false
-  kernel_size: 7
-  padding_mode: reflect
+  hidden_dim: 64
+  num_blocks: 7
+  kernel_size: 3
   output_dim: 128
 
 flow:

@@ -7,6 +7,140 @@ import torch.distributions as dists
 from sbi.utils.user_input_checks import MultipleIndependent
 
 
+PHYS_PARAM_NAMES = ["R0", "kD", "k_gb", "k_rb", "eta_g", "eta_r", "C_gr", "C_rg"]
+DEFAULT_INFERRED = ["logD", "knots", "R0"]
+_VALID_TOKENS = ("logD", "knots", *PHYS_PARAM_NAMES)
+
+
+def _canonical_indices(num_knots: int) -> dict:
+    """Token -> list of canonical-theta positions in the 16-dim layout.
+
+    Canonical layout (length num_knots + 9):
+        [logD, g_0..g_{n-1}, R0, kD, k_gb, k_rb, eta_g, eta_r, C_gr, C_rg]
+    """
+    out = {"logD": [0], "knots": list(range(1, num_knots + 1))}
+    for i, name in enumerate(PHYS_PARAM_NAMES):
+        out[name] = [num_knots + 1 + i]
+    return out
+
+
+def _resolve_inferred_tokens(cfg) -> List[str]:
+    raw = cfg.prior.get("inferred_params", DEFAULT_INFERRED)
+    tokens = list(raw) if raw is not None else list(DEFAULT_INFERRED)
+    if not tokens:
+        raise ValueError(
+            "inferred_params is empty. At least one token is required."
+        )
+    seen = set()
+    for tok in tokens:
+        if tok not in _VALID_TOKENS:
+            raise ValueError(
+                f"Unknown inferred_params token: {tok!r}. "
+                f"Valid: {list(_VALID_TOKENS)}"
+            )
+        if tok in seen:
+            raise ValueError(f"Duplicate inferred_params token: {tok!r}")
+        seen.add(tok)
+    canonical_order = {tok: i for i, tok in enumerate(("logD", "knots", *PHYS_PARAM_NAMES))}
+    return sorted(tokens, key=canonical_order.__getitem__)
+
+
+def _build_dists_for_token(cfg, token, num_knots, device, center, scale_):
+    if token == "logD":
+        return [dists.Uniform(
+            torch.tensor([cfg.prior.logD_lims[0]], device=device),
+            torch.tensor([cfg.prior.logD_lims[1]], device=device),
+        )]
+    if token == "knots":
+        return generate_spline_prior(
+            centers=center, scale=scale_, num_knots=num_knots, device=device
+        )
+    lo, hi = tuple(cfg.prior[f"{token}_lims"])
+    return [dists.Uniform(
+        torch.tensor([lo], device=device),
+        torch.tensor([hi], device=device),
+    )]
+
+
+def generate_split_priors_from_config(cfg, device: str = "cpu"):
+    """Return (inferred_prior, nuisance_prior, inferred_idx, nuisance_idx).
+
+    Honors the optional ``prior.inferred_params`` config key, which lists
+    the canonical parameter tokens to put in the inference posterior
+    (default: ``['logD', 'knots', 'R0']``). Anything not listed becomes a
+    per-trace nuisance.
+
+    Valid tokens: 'logD', 'knots', 'R0', 'kD', 'k_gb', 'k_rb', 'eta_g',
+    'eta_r', 'C_gr', 'C_rg'. Knots are all-or-nothing; the 'knots' token
+    expands to all g_0..g_{n-1}. The user-supplied token order is sorted
+    into canonical order internally so theta dim ordering is predictable.
+
+    The two LongTensors give canonical theta positions in the same order
+    as the components appear inside their respective MultipleIndependent
+    priors. Pair with ``assemble_canonical_theta`` to scatter samples
+    back into a canonical 16-dim theta the simulator wrapper consumes.
+
+    Under the default split this returns priors that are component-for-
+    component identical to ``generate_posterior_prior_from_config`` and
+    ``generate_nuisance_prior_from_config``.
+    """
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+    num_knots = cfg.prior.num_knots
+    center = list(cfg.prior.center) if cfg.prior.center is not None else None
+    scale_ = cfg.prior.scale
+
+    inferred_tokens = _resolve_inferred_tokens(cfg)
+    canonical = _canonical_indices(num_knots)
+
+    inferred_dists, inferred_idx = [], []
+    for tok in inferred_tokens:
+        inferred_dists.extend(
+            _build_dists_for_token(cfg, tok, num_knots, device, center, scale_)
+        )
+        inferred_idx.extend(canonical[tok])
+
+    inferred_set = set(inferred_tokens)
+    nuisance_dists, nuisance_idx = [], []
+    for tok in ("logD", "knots", *PHYS_PARAM_NAMES):
+        if tok not in inferred_set:
+            nuisance_dists.extend(
+                _build_dists_for_token(cfg, tok, num_knots, device, center, scale_)
+            )
+            nuisance_idx.extend(canonical[tok])
+
+    if not nuisance_dists:
+        raise ValueError(
+            "Empty nuisance set is not supported. Leave at least one "
+            "parameter out of inferred_params."
+        )
+
+    return (
+        MultipleIndependent(inferred_dists, device=device),
+        MultipleIndependent(nuisance_dists, device=device),
+        torch.tensor(inferred_idx, dtype=torch.long),
+        torch.tensor(nuisance_idx, dtype=torch.long),
+    )
+
+
+def assemble_canonical_theta(
+    inferred: torch.Tensor,
+    nuisance: torch.Tensor,
+    inferred_idx: torch.Tensor,
+    nuisance_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter (inferred, nuisance) into a single canonical-order theta.
+
+    Under the default split (inferred_idx = [0..num_knots+1], nuisance_idx
+    = [num_knots+2..num_knots+8]) this is bit-identical to
+    ``torch.cat([inferred, nuisance])``.
+    """
+    total = int(inferred_idx.numel() + nuisance_idx.numel())
+    out = torch.zeros(total, dtype=inferred.dtype, device=inferred.device)
+    out[inferred_idx] = inferred
+    out[nuisance_idx] = nuisance.to(device=out.device, dtype=out.dtype)
+    return out
+
+
 def generate_spline_prior(
         centers: Union[torch.Tensor, None] = None, 
         scale: float = 1.0, 

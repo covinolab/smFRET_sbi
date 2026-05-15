@@ -1,0 +1,24 @@
+name: fret_ssm
+# FretSSM has a fixed single-block structure (one paired G/R SSM scan).
+# Cost is ~2× PhotonDtSSM at the same hidden_dim due to the doubled scan;
+# start smaller than PhotonDtSSM to keep wall-clock comparable.
+hidden_dim: 16
+output_dim: 64
+# α initialised log-spaced over [1 μs, 100 ms] in ms units — matches the
+# simulator's time scale and the μs–ms range of FRET dynamics. Shared
+# between G and R branches so the per-timescale ratio E = λ_R/(λ_G+λ_R)
+# is computed at matched smoothing windows.
+alpha_init_range_ms: [1.0e-3, 1.0e+2]
+chunk_size: 64
+num_attn_heads: 2
+# L6 Poisson next-photon NLL weight on the gradient. Set to 0 to skip
+# the aux loss entirely (encoder will behave as pure L3+L4+L5). A value
+# around 0.05–0.2 is reasonable; if `Loss/train` starts oscillating or
+# decreasing while NPE-only val loss diverges, this is too high.
+aux_loss_weight: 0.5
+# When true, the L3 paired-branch core (the two scans + projections) is
+# wrapped in torch.utils.checkpoint at training time, freeing the scan
+# activations after forward and recomputing them during backward. Pays
+# ~30% wall-clock per step for a large peak-memory reduction — enables
+# more traces per set / larger hidden_dim. Off by default.
+gradient_checkpoint: false

@@ -44,19 +44,13 @@ from utils import (
 log = logging.getLogger(__name__)
 
 
-def _augment_with_mask(x, lengths):
-    """Append binary mask channel: 1=valid, 0=padded. x: [batch, T, 2] -> [batch, T, 3]"""
-    mask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
-    return torch.cat([x, mask.unsqueeze(-1).float()], dim=-1)
-
-
 def _unpack_batch(batch, device):
-    """Unpack a batch from the data loader, augmenting with mask channel if lengths present."""
-    if len(batch) == 3:
-        theta_batch, x_batch, lengths_batch = batch
-        x_batch = _augment_with_mask(x_batch, lengths_batch)
-    else:
-        theta_batch, x_batch = batch
+    """Unpack a batch from the data loader.
+
+    The loader yields `(theta, x)` where x has shape (B, N_max, 4) with
+    channels (log Δt, G_onehot, R_onehot, mask).
+    """
+    theta_batch, x_batch = batch
     return theta_batch.to(device, non_blocking=True), x_batch.to(device, non_blocking=True)
 
 
@@ -258,16 +252,17 @@ def train(cfg: DictConfig) -> float:
 
     temp_dataset = H5Dataset(h5_path)
     num_examples = len(temp_dataset)
-    has_lengths = temp_dataset.has_lengths
 
-    if has_lengths:
-        theta_init, x_init, lengths_init = temp_dataset[:100]
-        x_init = _augment_with_mask(x_init, lengths_init)
-        transition_dim = 3
-        log.info("Binding mode detected (variable-length traces with mask channel)")
-    else:
-        theta_init, x_init = temp_dataset[:100]
-        transition_dim = 2
+    theta_init, x_init = temp_dataset[:100]
+    # x channels: (log Δt, G_onehot, R_onehot, mask) → transition_dim = 4
+    transition_dim = 4
+    if x_init.ndim != 3:
+        raise ValueError(
+            f"train_ratio_estimator currently supports single-trace data only; "
+            f"got x_init.shape={tuple(x_init.shape)}. For set-mode data use "
+            f"train_density_estimator.py."
+        )
+    log.info("Per-photon-events mode (x channels: log_dt, G_oh, R_oh, mask)")
 
     max_len = x_init.shape[1]
     probe_x = x_init[: min(8, x_init.shape[0])].clone()

@@ -59,6 +59,23 @@ def _gsl_dirs():
 
 gsl_include_dirs, gsl_library_dirs = _gsl_dirs()
 
+# Aggressive C compile flags. `-march=native` enables AVX/SSE for this CPU,
+# `-flto` allows the linker to inline across .c files (and across the
+# Cython-generated wrappers), `-funroll-loops` helps the tight Langevin
+# step loop. The resulting .so is non-portable (CPU-specific); fine for
+# in-place research builds.
+EXTRA_CFLAGS = [
+    "-O3",
+    "-ffast-math",
+    "-march=native",
+    "-mtune=native",
+    "-funroll-loops",
+    "-fno-plt",            # cheaper external calls (gsl_spline_eval_e, gsl_ran_*)
+    "-fomit-frame-pointer",
+    "-flto",
+]
+EXTRA_LDFLAGS = ["-flto"]
+
 # Define the extension
 extensions = [
     Extension(
@@ -67,7 +84,8 @@ extensions = [
         libraries=["gsl", "gslcblas", "m"],  # GSL libraries
         include_dirs=[np.get_include()] + gsl_include_dirs,
         library_dirs=gsl_library_dirs,
-        extra_compile_args=["-O3", "-ffast-math"],
+        extra_compile_args=EXTRA_CFLAGS,
+        extra_link_args=EXTRA_LDFLAGS,
     ),
     Extension(
         name="gsl_spline",  # GSL spline Python wrapper
@@ -75,11 +93,14 @@ extensions = [
         libraries=["gsl", "gslcblas", "m"],
         include_dirs=[np.get_include()] + gsl_include_dirs,
         library_dirs=gsl_library_dirs,
-        extra_compile_args=["-O3", "-ffast-math"],
+        extra_compile_args=EXTRA_CFLAGS,
+        extra_link_args=EXTRA_LDFLAGS,
     ),
 ]
 
-# Cythonize with settings
+# Cythonize with settings. The extra directives skip remaining safety checks
+# that don't apply to this codebase (we never assign None to cdef variables,
+# never access Python attributes from C code).
 ext_modules = cythonize(
     extensions,
     compiler_directives={
@@ -87,6 +108,12 @@ ext_modules = cythonize(
         "boundscheck": False,
         "wraparound": False,
         "cdivision": True,
+        "initializedcheck": False,
+        "nonecheck": False,
+        "always_allow_keywords": False,
+        "embedsignature": False,
+        "optimize.use_switch": True,
+        "optimize.unpack_method_calls": True,
     },
 )
 

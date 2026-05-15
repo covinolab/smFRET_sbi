@@ -1,0 +1,35 @@
+defaults:
+  - _self_
+
+model:
+  estimator_path: ${oc.env:FRET_SBI_ROOT,/home/dingeldein/Desktop/fret_sbi}/smFRET_sbi/outputs/exp_6.1/2026-05-05/10-51-51/last_npe_set_estimator.pkl
+  data_config_path: ${oc.env:FRET_SBI_ROOT,/home/dingeldein/Desktop/fret_sbi}/smFRET_sbi/outputs/exp_6.1/2026-05-05/10-51-51/data_config.yaml
+
+data:
+  root: ${oc.env:FRET_SBI_ROOT,/home/dingeldein/Desktop/fret_sbi}/data_ben_schuler/Sturzenegger_transition_path_data
+  conditions: [ACTR-avi-Cy3B_NCBD-CF660R_50mMNaPi_50mMNaCl]
+  num_traces_per_round: 50
+
+rounds:
+  num_rounds: 3
+  base_seed: 42
+
+inference:
+  num_posterior_samples: 5000
+  posterior_batch_size: 1000
+  log_prob_batch_size: 30
+  map_num_iter: 1000
+  map_learning_rate: 0.005
+  map_num_init_samples: 500  # = top-k posterior samples used as MAP inits
+
+ppc:
+  num_trajectories: 10
+  max_retries_per_trace: 10
+
+device: cuda
+
+hydra:
+  run:
+    dir: ${oc.env:FRET_SBI_ROOT,/home/dingeldein/Desktop/fret_sbi}/smFRET_sbi/outputs/analysis/exp_6.1/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

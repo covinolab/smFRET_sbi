@@ -71,6 +71,8 @@ class H5Dataset(IterableDataset):
     ... )
     """
 
+    LOG_IPT_EPS = 1e-12  # ε added inside log(Δt + ε); sub-picosecond, well below any real timing scale.
+
     def __init__(
         self,
         file: Union[str, Path],
@@ -91,7 +93,10 @@ class H5Dataset(IterableDataset):
 
         with h5py.File(self.file_path, 'r') as f:
             self._total_len = len(f['theta'])
-            self._has_lengths = 'lengths' in f
+            self._n_max_photons = int(f.attrs.get('n_max_photons',
+                                                  f['interphoton_times'].shape[-1]))
+            # set-based mode: ipt has shape (N_sims, num_traces_per_set, N_max)
+            self._is_set_mode = f['interphoton_times'].ndim == 3
 
         self._file = None
 
@@ -173,18 +178,58 @@ class H5Dataset(IterableDataset):
         return total_batches
 
     @property
-    def has_lengths(self) -> bool:
-        """Whether this dataset contains variable-length traces with stored lengths."""
-        return self._has_lengths
+    def n_max_photons(self) -> int:
+        """Padding budget per trace (last axis of interphoton_times)."""
+        return self._n_max_photons
 
-    def __getitem__(self, i: Union[int, slice]) -> Tuple[Tensor, ...]:
+    @property
+    def is_set_mode(self) -> bool:
+        """Whether each sample is a stack of num_traces_per_set traces."""
+        return self._is_set_mode
+
+    @classmethod
+    def _arrivals_to_x(
+        cls,
+        ipt: np.ndarray,
+        chans: np.ndarray,
+        lengths: np.ndarray,
+    ) -> Tensor:
+        """Convert (interphoton_times, channels, lengths) → single `x` tensor.
+
+        x has 4 channels per photon: (log(Δt + ε), G_onehot, R_onehot, mask).
+        The last channel is the validity mask (1=real photon, 0=padding) —
+        PhotonTCN extracts it with `mask = x[..., -1].bool()`.
+
+        Inputs (numpy):
+            ipt     : shape (..., N_max), float
+            chans   : shape (..., N_max), uint8 in {0, 1}
+            lengths : shape (...),        integer
+        Returns (torch): shape (..., N_max, 4), float32
+        """
+        n_max = ipt.shape[-1]
+        ipt_f32 = ipt.astype(np.float32, copy=False)
+        log_ipt = np.log(ipt_f32 + np.float32(cls.LOG_IPT_EPS))
+        g_oh = (chans == 0).astype(np.float32)
+        r_oh = (chans == 1).astype(np.float32)
+        idx = np.arange(n_max, dtype=np.int64)
+        mask_bool = idx < lengths[..., None]  # (..., n_max)
+        mask_f = mask_bool.astype(np.float32)
+        # Zero out features in padded positions (defensive; the mask channel is
+        # what PhotonTCN's pool gates on, but other consumers may not check).
+        log_ipt = log_ipt * mask_f
+        g_oh = g_oh * mask_f
+        r_oh = r_oh * mask_f
+        x = np.stack([log_ipt, g_oh, r_oh, mask_f], axis=-1)
+        return torch.from_numpy(x)
+
+    def __getitem__(self, i: Union[int, slice]) -> Tuple[Tensor, Tensor]:
         """Random access for initialization (uses contiguous reads)."""
         f = self._get_file()
         theta = torch.from_numpy(f['theta'][i].astype(np.float32))
-        x = torch.from_numpy(f['x'][i].astype(np.float32))
-        if self._has_lengths:
-            lengths = torch.from_numpy(np.asarray(f['lengths'][i], dtype=np.int64))
-            return theta, x, lengths
+        ipt = np.asarray(f['interphoton_times'][i])
+        chans = np.asarray(f['channels'][i])
+        lengths = np.asarray(f['lengths'][i], dtype=np.int64)
+        x = self._arrivals_to_x(ipt, chans, lengths)
         return theta, x
 
     def _get_worker_chunks(self) -> List[int]:
@@ -194,7 +239,7 @@ class H5Dataset(IterableDataset):
             return self._chunk_list
         return self._partition_chunks(self._chunk_list, worker_info.num_workers, worker_info.id)
 
-    def __iter__(self) -> Iterator[Tuple[Tensor, ...]]:
+    def __iter__(self) -> Iterator[Tuple[Tensor, Tensor]]:
         f = self._get_file()
 
         worker_chunks = self._get_worker_chunks()
@@ -210,39 +255,29 @@ class H5Dataset(IterableDataset):
             group = bounds[i:i + self.chunk_step]
             intervals = self._merge_contiguous(group)
 
-            theta = np.concatenate([f['theta'][s:e] for s, e in intervals])
-            x = np.concatenate([f['x'][s:e] for s, e in intervals])
-            theta = torch.from_numpy(theta.astype(np.float32))
-            x = torch.from_numpy(x.astype(np.float32))
+            theta_np = np.concatenate([f['theta'][s:e] for s, e in intervals])
+            ipt_np = np.concatenate([f['interphoton_times'][s:e] for s, e in intervals])
+            chans_np = np.concatenate([f['channels'][s:e] for s, e in intervals])
+            lengths_np = np.concatenate([f['lengths'][s:e] for s, e in intervals])
+            lengths_np = lengths_np.astype(np.int64, copy=False)
 
-            if self._has_lengths:
-                lengths = np.concatenate([f['lengths'][s:e] for s, e in intervals])
-                lengths = torch.from_numpy(lengths.astype(np.int64))
-            else:
-                lengths = None
+            theta = torch.from_numpy(theta_np.astype(np.float32))
+            x = self._arrivals_to_x(ipt_np, chans_np, lengths_np)
 
             if self.shuffle:
                 order = torch.randperm(len(theta))
-                theta, x = theta[order], x[order]
-                if lengths is not None:
-                    lengths = lengths[order]
+                theta = theta[order]
+                x = x[order]
 
             if self.batch_size is None:
-                if lengths is not None:
-                    yield from zip(theta, x, lengths)
-                else:
-                    yield from zip(theta, x)
+                yield from zip(theta, x)
             else:
                 theta_splits = theta.split(self.batch_size)
                 x_splits = x.split(self.batch_size)
-                lengths_splits = lengths.split(self.batch_size) if lengths is not None else [None] * len(theta_splits)
-                for tb, xb, lb in zip(theta_splits, x_splits, lengths_splits):
+                for tb, xb in zip(theta_splits, x_splits):
                     if self.drop_last and len(tb) < self.batch_size:
                         continue
-                    if lb is not None:
-                        yield tb, xb, lb
-                    else:
-                        yield tb, xb
+                    yield tb, xb
 
     def __del__(self):
         if self._file is not None:

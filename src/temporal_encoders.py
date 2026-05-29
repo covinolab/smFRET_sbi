@@ -727,6 +727,307 @@ class FretSSM(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# FretSSMDeep — deep variant with shared SSM trunk + paired final readout
+# ---------------------------------------------------------------------------
+#
+# Entirely additive (does not touch FretSSM). To remove:
+#   1. Delete the FretSSMBlock and FretSSMDeep classes below.
+#   2. Delete the `fret_ssm_deep` branch in build_temporal_encoder().
+#   3. Delete conf/training/embedding/fret_ssm_deep.yaml.
+
+class FretSSMBlock(nn.Module):
+    """Transformer-style residual SSM block used in FretSSMDeep's shared trunk.
+
+    Pre-norm → in_proj → dt_aware_scan → out_proj → +residual
+            → norm → MLP → +residual
+
+    No channel gating — channel identity comes from the input features, so
+    in_proj learns channel-dependent updates without explicit masking. Each
+    block has its own α-bank so different layers can specialize to different
+    timescales.
+    """
+
+    def __init__(self,
+                 hidden_dim: int,
+                 alpha_init_range_ms=(1e-3, 1e2),
+                 chunk_size: int = 64,
+                 mlp_mult: int = 4):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.in_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        log_lo = math.log(float(alpha_init_range_ms[0]))
+        log_hi = math.log(float(alpha_init_range_ms[1]))
+        alpha_init = torch.exp(torch.linspace(log_lo, log_hi, hidden_dim)).clamp(min=1e-6)
+        # softplus(raw) = α inverse: raw = α + log(1 − exp(−α)).
+        raw_alpha_init = alpha_init + torch.log(-torch.expm1(-alpha_init))
+        self.raw_alpha = nn.Parameter(raw_alpha_init)
+
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_mult * hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_mult * hidden_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor, dt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        m = mask.unsqueeze(-1)
+        h = self.norm1(x) * m
+        h = self.in_proj(h)
+        alpha = F.softplus(self.raw_alpha)
+        h = dt_aware_scan(h, dt, mask, alpha, chunk_size=self.chunk_size)
+        h = self.out_proj(h)
+        x = x + h
+        x = x + self.mlp(self.norm2(x))
+        return x * m
+
+
+class FretSSMDeep(nn.Module):
+    """Deep FretSSM with shared SSM trunk and paired final-layer rate readout.
+
+    Architecture:
+
+        input_proj → pre_norm
+          → [FretSSMBlock × n_ssm]                 # shared trunk; all photons
+          │                                          drive the same latent
+          → paired final SSM (shared α-bank between G/R)
+          │   ├── in_proj_G · G_oh → scan → out_proj_G → softplus → λ_G
+          │   └── in_proj_R · R_oh → scan → out_proj_R → softplus → λ_R
+          → L4 brightness-invariant pool (E, log-ratio, rel-log-total)
+          → L5 nuisance head
+          → L6 Poisson next-photon NLL (aux loss, gated by aux_loss_weight)
+
+    Why shared trunk + paired readout (instead of pure shared with linear
+    heads or pure paired like FretSSM):
+
+      - Shared trunk: the underlying conformational state E_t modulates BOTH
+        rates simultaneously. A single shared latent integrating ALL photons
+        is statistically more efficient than two isolated branches each
+        seeing only half the data.
+
+      - Paired final layer with shared α-bank: preserves L4's matched-
+        timescale-per-h inductive bias. λ_G[h] and λ_R[h] are integrated at
+        the SAME α[h], so log(λ_R[h]/λ_G[h]) is a per-timescale FRET-ratio
+        feature, just like in FretSSM. The attention pool sees a multi-
+        resolution view of the joint dynamics.
+
+    Output shape: (B, output_dim + NUM_NUISANCES).
+
+    Knobs vs FretSSM:
+      - `n_ssm`: depth of the shared trunk (default 2). `n_ssm=0` collapses
+        to a stripped-down single-paired-layer model (no L3-style separation
+        but no shared trunk either — not generally useful; use FretSSM for
+        the zero-depth case).
+      - `mlp_mult`: MLP expansion factor inside each shared block.
+
+    L4 / L5 / L6 logic is structurally identical to FretSSM — duplicated
+    here to keep the class self-contained (FretSSM is untouched).
+    """
+
+    EPS_RATE = 1e-6
+    LOG_RATIO_CLAMP = 8.0
+    NUM_NUISANCES = 5
+    GLOBAL_STATS_DIM = 8
+
+    def __init__(self,
+                 transition_dim: int = 4,
+                 hidden_dim: int = 64,
+                 output_dim: int = 128,
+                 alpha_init_range_ms=(1e-3, 1e2),
+                 chunk_size: int = 64,
+                 num_attn_heads: int = 4,
+                 aux_loss_weight: float = 0.0,
+                 gradient_checkpoint: bool = False,
+                 n_ssm: int = 2,
+                 mlp_mult: int = 4,
+                 **_ignored):
+        super().__init__()
+        if transition_dim < 4:
+            raise ValueError(
+                f"FretSSMDeep expects transition_dim >= 4 (log_dt, G_oh, R_oh, mask); "
+                f"got transition_dim={transition_dim}"
+            )
+        self.transition_dim = transition_dim
+        self.num_feature_channels = transition_dim - 1
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.chunk_size = chunk_size
+        self.aux_loss_weight = float(aux_loss_weight)
+        self.gradient_checkpoint = bool(gradient_checkpoint)
+        self.n_ssm = int(n_ssm)
+
+        # Input projection + pre-norm.
+        self.input_proj = nn.Linear(self.num_feature_channels, hidden_dim, bias=False)
+        self.pre_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+
+        # Shared SSM trunk: n_ssm transformer-style residual blocks. Each
+        # block has its own α-bank.
+        self.trunk_blocks = nn.ModuleList([
+            FretSSMBlock(hidden_dim, alpha_init_range_ms, chunk_size, mlp_mult)
+            for _ in range(self.n_ssm)
+        ])
+
+        # Paired final readout: shared α-bank between G and R (matched
+        # timescales for L4). Channel-gated input projections.
+        log_lo = math.log(float(alpha_init_range_ms[0]))
+        log_hi = math.log(float(alpha_init_range_ms[1]))
+        alpha_init = torch.exp(torch.linspace(log_lo, log_hi, hidden_dim)).clamp(min=1e-6)
+        raw_alpha_init = alpha_init + torch.log(-torch.expm1(-alpha_init))
+        self.raw_alpha_readout = nn.Parameter(raw_alpha_init)
+        self.in_proj_G = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.in_proj_R = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj_G = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj_R = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        # L4 pool over the (E, log-ratio, rel-log-total) feature stream.
+        self.attn_pool = MaskedAttentionPool(3 * hidden_dim, num_heads=num_attn_heads)
+        pool_dim = (2 + num_attn_heads) * 3 * hidden_dim
+        self.head = nn.Sequential(
+            nn.Linear(pool_dim, output_dim),
+            nn.GELU(),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim, elementwise_affine=False),
+        )
+
+        # L5 nuisance head.
+        self.nuisance_head = nn.Sequential(
+            nn.Linear(self.GLOBAL_STATS_DIM, 32),
+            nn.GELU(),
+            nn.Linear(32, self.NUM_NUISANCES),
+        )
+
+        # L6 stash. Training script reads `last_aux_loss` if aux_loss_weight > 0.
+        self.last_aux_loss = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, transition_dim). Channels: (log_dt, G_oh, R_oh, mask).
+        features = x[..., :self.num_feature_channels]
+        log_dt = x[..., 0]
+        G_oh = x[..., 1]
+        R_oh = x[..., 2]
+        mask = x[..., -1]
+        dt = (torch.exp(log_dt) - LOG_IPT_EPS).clamp(min=0.0)
+
+        # Project + pre-norm; zero out padded positions defensively.
+        h = self.pre_norm(self.input_proj(features)) * mask.unsqueeze(-1)
+
+        # Shared trunk. Each block optionally checkpointed during training to
+        # free its activations; total checkpointed memory scales 1/n_ssm.
+        if self.gradient_checkpoint and self.training:
+            for blk in self.trunk_blocks:
+                h = _checkpoint(blk, h, dt, mask, use_reentrant=False)
+        else:
+            for blk in self.trunk_blocks:
+                h = blk(h, dt, mask)
+
+        # Paired final readout with shared α-bank.
+        alpha_readout = F.softplus(self.raw_alpha_readout)
+        if self.gradient_checkpoint and self.training:
+            lam_G, lam_R = _checkpoint(
+                self._paired_readout, h, dt, G_oh, R_oh, mask, alpha_readout,
+                use_reentrant=False,
+            )
+        else:
+            lam_G, lam_R = self._paired_readout(h, dt, G_oh, R_oh, mask, alpha_readout)
+
+        # L4: brightness-invariant feature stream for the pool.
+        lam_total = lam_G + lam_R
+        E = lam_R / lam_total
+        log_ratio = (torch.log(lam_R) - torch.log(lam_G)).clamp(
+            -self.LOG_RATIO_CLAMP, self.LOG_RATIO_CLAMP
+        )
+        log_total = torch.log(lam_total)
+        rel_log_total = log_total - log_total.mean(dim=-1, keepdim=True)
+        feats = torch.cat([E, log_ratio, rel_log_total], dim=-1)
+        m = mask.unsqueeze(-1)
+        feats = feats * m
+
+        # Mean + std + attention pool over time.
+        denom = m.sum(dim=1).clamp(min=1.0)
+        mean = (feats * m).sum(dim=1) / denom
+        var = ((feats * feats) * m).sum(dim=1) / denom - mean * mean
+        std = var.clamp(min=1e-8).sqrt()
+        attn = self.attn_pool(feats.transpose(1, 2), mask)
+        pooled = torch.cat([mean, std, attn], dim=-1)
+        emb_main = self.head(pooled)
+
+        # L5: nuisance head.
+        stats = self._global_stats(lam_G, lam_R, log_dt, G_oh, mask, denom)
+        psi = self.nuisance_head(stats)
+
+        # L6: Poisson next-photon NLL aux loss.
+        if self.training and self.aux_loss_weight > 0:
+            self.last_aux_loss = self._poisson_aux_loss(
+                lam_G, lam_R, dt, G_oh, R_oh, mask
+            )
+        else:
+            self.last_aux_loss = None
+
+        return torch.cat([emb_main, psi], dim=-1)
+
+    def _paired_readout(self, h, dt, G_oh, R_oh, mask, alpha):
+        """Paired final SSM with shared α-bank.
+
+        Mirrors FretSSM._branch_forward but operates on the shared-trunk
+        output `h` rather than the projected input.
+        """
+        u_G = self.in_proj_G(h) * G_oh.unsqueeze(-1)
+        h_G = dt_aware_scan(u_G, dt, mask, alpha, chunk_size=self.chunk_size)
+        lam_G = F.softplus(self.out_proj_G(h_G)) + self.EPS_RATE
+
+        u_R = self.in_proj_R(h) * R_oh.unsqueeze(-1)
+        h_R = dt_aware_scan(u_R, dt, mask, alpha, chunk_size=self.chunk_size)
+        lam_R = F.softplus(self.out_proj_R(h_R)) + self.EPS_RATE
+        return lam_G, lam_R
+
+    def _global_stats(self, lam_G, lam_R, log_dt, G_oh, mask, denom):
+        """Per-trace 8-d summary fed to the nuisance head. Same as FretSSM."""
+        m = mask.unsqueeze(-1)
+        log_lam_G_mean = ((torch.log(lam_G) * m).sum(dim=1) / denom).mean(dim=-1, keepdim=True)
+        log_lam_R_mean = ((torch.log(lam_R) * m).sum(dim=1) / denom).mean(dim=-1, keepdim=True)
+        log_lam_tot_mean = ((torch.log(lam_G + lam_R) * m).sum(dim=1) / denom).mean(dim=-1, keepdim=True)
+        log_n_real = torch.log(mask.sum(dim=1, keepdim=True) + 1.0)
+        denom_2d = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        g_frac = (G_oh * mask).sum(dim=1, keepdim=True) / denom_2d
+        log_dt_mean = (log_dt * mask).sum(dim=1, keepdim=True) / denom_2d
+        E_per_event = lam_R / (lam_G + lam_R)
+        E_mean = ((E_per_event * m).sum(dim=1) / denom).mean(dim=-1, keepdim=True)
+        log_brightness_ratio = log_lam_G_mean - log_lam_R_mean
+        return torch.cat([
+            log_lam_G_mean, log_lam_R_mean, log_lam_tot_mean,
+            log_n_real, g_frac, log_dt_mean, E_mean,
+            log_brightness_ratio,
+        ], dim=-1)
+
+    def _poisson_aux_loss(self, lam_G, lam_R, dt, G_oh, R_oh, mask):
+        """Next-photon Poisson NLL using rate estimates at the previous event.
+
+        Same formulation as FretSSM._poisson_aux_loss.
+        """
+        lam_G_t = lam_G.mean(dim=-1)
+        lam_R_t = lam_R.mean(dim=-1)
+        lam_tot_t = lam_G_t + lam_R_t
+
+        lam_G_pred = lam_G_t[:, :-1]
+        lam_R_pred = lam_R_t[:, :-1]
+        lam_tot_pred = lam_tot_t[:, :-1]
+        c_G_next = G_oh[:, 1:]
+        c_R_next = R_oh[:, 1:]
+        dt_next = dt[:, 1:]
+        pair_mask = mask[:, :-1] * mask[:, 1:]
+
+        log_lik = (
+            c_G_next * torch.log(lam_G_pred) + c_R_next * torch.log(lam_R_pred)
+            - lam_tot_pred * dt_next
+        ) * pair_mask
+        n_pairs = pair_mask.sum(dim=1).clamp(min=1)
+        nll = -log_lik.sum(dim=1) / n_pairs
+        return nll.mean()
+
+
+# ---------------------------------------------------------------------------
 # Set-mode wrapper (multi-trace per parameter)
 # ---------------------------------------------------------------------------
 
@@ -817,9 +1118,29 @@ def build_temporal_encoder(cfg_embedding, transition_dim, max_len=None):
             aux_loss_weight=float(getattr(cfg_embedding, "aux_loss_weight", 0.0)),
             gradient_checkpoint=bool(getattr(cfg_embedding, "gradient_checkpoint", False)),
         )
+    if encoder_name in {"fret_ssm_deep", "fretssmdeep"}:
+        alpha_range = getattr(cfg_embedding, "alpha_init_range_ms", (1e-3, 1e2))
+        if not isinstance(alpha_range, tuple):
+            alpha_range = tuple(float(v) for v in alpha_range)
+        return FretSSMDeep(
+            transition_dim=transition_dim,
+            hidden_dim=int(getattr(cfg_embedding, "hidden_dim", 64)),
+            output_dim=int(getattr(cfg_embedding, "output_dim", 128)),
+            alpha_init_range_ms=alpha_range,
+            chunk_size=int(getattr(cfg_embedding, "chunk_size", 64)),
+            num_attn_heads=num_attn_heads,
+            aux_loss_weight=float(getattr(cfg_embedding, "aux_loss_weight", 0.0)),
+            gradient_checkpoint=bool(getattr(cfg_embedding, "gradient_checkpoint", False)),
+            n_ssm=int(getattr(cfg_embedding, "n_ssm", 2)),
+            mlp_mult=int(getattr(cfg_embedding, "mlp_mult", 4)),
+        )
+    if encoder_name in {"smfret_photon", "smfretphoton"}:
+        from smfret_photon_encoder import build_smfret_photon_encoder
+        return build_smfret_photon_encoder(cfg_embedding, transition_dim)
     raise ValueError(
         f"Unknown embedding.name='{encoder_name}'. "
-        f"Supported: 'photon_tcn', 'photon_dt_ssm', 'fret_ssm'."
+        f"Supported: 'photon_tcn', 'photon_dt_ssm', 'fret_ssm', "
+        f"'fret_ssm_deep', 'smfret_photon'."
     )
 
 

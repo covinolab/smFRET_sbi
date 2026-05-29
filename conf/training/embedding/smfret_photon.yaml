@@ -1,0 +1,13 @@
+name: smfret_photon
+d_model: 128
+d_state: 64
+n_ssm: 4
+m_inducing: 16
+k_seeds: 4
+output_dim: 64           # d_z (summary dim fed to the flow)
+K: 8                     # LogNormMix components in NextPhotonHead
+use_next_photon: true
+aux_loss_weight: 0.5     # beta from spec; anneal externally if desired
+forward_chunk_size: null # micro-batch over the leading dim (null = no chunking)
+chunk_size: 64           # inner-scan chunk size for the diagonal SSM (matches FretSSM)
+alpha_init_range_ms: [1.0e-3, 1.0e+2]  # log-spaced init for SSM decay rates

@@ -82,6 +82,7 @@ class H5Dataset(IterableDataset):
         shuffle: bool = False,
         chunk_indices: Optional[List[int]] = None,
         drop_last: bool = False,
+        length_buckets: Optional[List[int]] = None,
     ):
         super().__init__()
         self.file_path = Path(file)
@@ -97,6 +98,24 @@ class H5Dataset(IterableDataset):
                                                   f['interphoton_times'].shape[-1]))
             # set-based mode: ipt has shape (N_sims, num_traces_per_set, N_max)
             self._is_set_mode = f['interphoton_times'].ndim == 3
+
+        # Length buckets: each batch is trimmed (along the photon axis) to the
+        # smallest bucket >= its local max. A small fixed set of bucket sizes
+        # bounds the number of distinct compiled graphs under torch.compile.
+        # The top bucket is always pinned at n_max_photons so the trim is a
+        # no-op when a batch happens to contain a max-length trace.
+        if length_buckets is None:
+            buckets: List[int] = []
+            b = 256
+            while b < self._n_max_photons:
+                buckets.append(b)
+                b *= 2
+            buckets.append(self._n_max_photons)
+        else:
+            buckets = sorted({int(b) for b in length_buckets if int(b) > 0})
+            if not buckets or buckets[-1] < self._n_max_photons:
+                buckets.append(self._n_max_photons)
+        self._length_buckets: Tuple[int, ...] = tuple(buckets)
 
         self._file = None
 
@@ -122,6 +141,14 @@ class H5Dataset(IterableDataset):
     def _partition_chunks(chunk_list: List[int], num_workers: int, worker_id: int) -> List[int]:
         """Round-robin partition of chunk_list for a given worker."""
         return [c for i, c in enumerate(chunk_list) if i % num_workers == worker_id]
+
+    @staticmethod
+    def _bucket_up(n: int, buckets: Tuple[int, ...]) -> int:
+        """Smallest bucket >= n; falls back to n if it exceeds every bucket."""
+        for b in buckets:
+            if n <= b:
+                return b
+        return n
 
     @staticmethod
     def _merge_contiguous(bounds: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
@@ -261,22 +288,43 @@ class H5Dataset(IterableDataset):
             lengths_np = np.concatenate([f['lengths'][s:e] for s, e in intervals])
             lengths_np = lengths_np.astype(np.int64, copy=False)
 
+            # Group-level bucket trim: drop zero-padding past the bucketed max
+            # for the whole loaded buffer before the log/one-hot work in
+            # _arrivals_to_x. Bucketed (not exact) so it stays >= every
+            # subsequent per-batch bucket.
+            group_max = int(lengths_np.max()) if lengths_np.size else 0
+            group_bucket = self._bucket_up(group_max, self._length_buckets)
+            if group_bucket < ipt_np.shape[-1]:
+                ipt_np = ipt_np[..., :group_bucket]
+                chans_np = chans_np[..., :group_bucket]
+
             theta = torch.from_numpy(theta_np.astype(np.float32))
             x = self._arrivals_to_x(ipt_np, chans_np, lengths_np)
+            lengths = torch.from_numpy(lengths_np)
 
             if self.shuffle:
                 order = torch.randperm(len(theta))
                 theta = theta[order]
                 x = x[order]
+                lengths = lengths[order]
 
             if self.batch_size is None:
                 yield from zip(theta, x)
             else:
                 theta_splits = theta.split(self.batch_size)
                 x_splits = x.split(self.batch_size)
-                for tb, xb in zip(theta_splits, x_splits):
+                lengths_splits = lengths.split(self.batch_size)
+                for tb, xb, lb in zip(theta_splits, x_splits, lengths_splits):
                     if self.drop_last and len(tb) < self.batch_size:
                         continue
+                    # Per-batch bucket trim along the photon axis (dim -2).
+                    # local_bucket is drawn from a fixed set, so the encoder
+                    # sees at most len(length_buckets) distinct shapes — keeps
+                    # torch.compile from recompiling per batch.
+                    local_max = int(lb.max().item())
+                    local_bucket = self._bucket_up(local_max, self._length_buckets)
+                    if local_bucket < xb.shape[-2]:
+                        xb = xb[..., :local_bucket, :].contiguous()
                     yield tb, xb
 
     def __del__(self):

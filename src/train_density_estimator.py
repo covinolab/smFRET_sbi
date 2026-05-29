@@ -357,7 +357,8 @@ def train(cfg: DictConfig) -> float:
     optimizer = torch.optim.AdamW(
         density_estimator.parameters(),
         weight_decay=cfg.optimizer.weight_decay,
-        lr=cfg.optimizer.lr
+        lr=cfg.optimizer.lr,
+        fused=True if torch.__version__ >= "2.0" else False,
     )
 
     scheduler_cfg = cfg.scheduler if "scheduler" in cfg and cfg.scheduler is not None else None

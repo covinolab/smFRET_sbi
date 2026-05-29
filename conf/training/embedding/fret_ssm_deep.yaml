@@ -1,0 +1,45 @@
+name: fret_ssm_deep
+# FretSSMDeep architecture:
+#   input_proj → pre_norm
+#     → [FretSSMBlock × n_ssm]               # shared SSM trunk
+#     → paired final SSM (shared α-bank)     # per-channel rate readout
+#     → L4 brightness-invariant pool
+#     → L5 nuisance head
+#     → L6 Poisson aux loss
+#
+# Cost is roughly (n_ssm + 1) × FretSSM's single-block scan, so start small.
+# At hidden_dim=16, n_ssm=2: ~3× FretSSM wall-clock per step.
+hidden_dim: 16
+output_dim: 64
+
+# Depth of the shared SSM trunk. Each block has its own α-bank (per-block
+# timescale specialization). The paired final readout adds one more SSM
+# scan per channel with a shared α-bank (matched timescales preserved
+# for the L4 brightness-invariant pool).
+n_ssm: 2
+
+# MLP expansion factor inside each shared-trunk block.
+mlp_mult: 4
+
+# α initialised log-spaced over [1 μs, 100 ms] in ms units. Used as the
+# init range for each trunk block's α-bank AND for the paired final
+# layer's shared α-bank.
+alpha_init_range_ms: [1.0e-3, 1.0e+2]
+
+chunk_size: 64
+num_attn_heads: 2
+
+# L6 Poisson next-photon NLL weight on the gradient. With shared trunk
+# the aux loss only constrains 2 scalar projections of the latent (ratio
+# + total), so it's lower-rank supervision than FretSSM's paired L6.
+# Default to a slightly higher value than FretSSM (0.5 vs FretSSM's
+# typical 0.03-0.1) so the encoder still gets meaningful aux gradient.
+# If val NPE loss is worse than FretSSM baseline at this weight, bump
+# 2-4× or revisit the architecture.
+aux_loss_weight: 0.5
+
+# When true, each trunk block AND the paired-readout core are wrapped in
+# torch.utils.checkpoint at training time. Peak memory drops ~(1/n_ssm)
+# in the trunk plus the constant paired-readout savings, at ~30%
+# wall-clock cost. Off by default.
+gradient_checkpoint: false

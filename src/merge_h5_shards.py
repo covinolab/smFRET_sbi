@@ -18,6 +18,16 @@ from tqdm import tqdm
 
 DEFAULT_MAX_BATCH_BYTES = 256 * 1024 * 1024
 
+# Schema-v2 (photon-level) datasets produced by generate_simulations.py, in
+# canonical order. "theta" is first and acts as the sample-count anchor that
+# every other dataset is validated against.
+MERGE_DATASETS = ("theta", "interphoton_times", "channels", "lengths")
+
+# Format-describing attributes carried from the source shards into the merged
+# output (after validating they agree across shards). n_max_photons in
+# particular is read back by data_loaders.H5Dataset.
+FORMAT_ATTRS = ("schema_version", "n_max_photons", "num_traces_per_set")
+
 
 @dataclass(frozen=True)
 class DatasetLayout:
@@ -53,7 +63,10 @@ class ShardInfo:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Merge shard HDF5 files produced by generate_simulations.py into one data.h5 file."
+        description=(
+            "Merge schema-v2 shard HDF5 files (theta / interphoton_times / channels / "
+            "lengths) produced by generate_simulations.py into one consolidated data.h5 file."
+        )
     )
     parser.add_argument(
         "input_dir",
@@ -124,93 +137,87 @@ def find_shards(input_dir: Path, pattern: str) -> list[Path]:
     return sorted(files, key=natural_sort_key)
 
 
+def read_format_attrs(f: h5py.File) -> dict[str, Any]:
+    """Read the format-describing attributes, deriving any that are missing.
+
+    generate_simulations.py always writes these, but we fall back to deriving
+    ``n_max_photons``/``num_traces_per_set`` from the ``interphoton_times`` shape
+    so a shard that omitted them still produces a self-describing merged file.
+    """
+    attrs: dict[str, Any] = {k: f.attrs.get(k) for k in FORMAT_ATTRS}
+
+    ipt = f["interphoton_times"]
+    if attrs["n_max_photons"] is None:
+        attrs["n_max_photons"] = int(ipt.shape[-1])
+    if attrs["num_traces_per_set"] is None:
+        attrs["num_traces_per_set"] = int(ipt.shape[1]) if ipt.ndim == 3 else 1
+    return attrs
+
+
 def inspect_shards(
     files: list[Path],
-) -> tuple[list[ShardInfo], DatasetLayout, DatasetLayout, DatasetLayout | None]:
+) -> tuple[list[ShardInfo], dict[str, DatasetLayout], dict[str, Any]]:
     shard_infos: list[ShardInfo] = []
-    theta_layout: DatasetLayout | None = None
-    x_layout: DatasetLayout | None = None
-    lengths_layout: DatasetLayout | None = None
-    lengths_reference_path: Path | None = None
+    layouts: dict[str, DatasetLayout] | None = None
+    format_attrs: dict[str, Any] | None = None
     first_path: Path | None = None
 
     for path in files:
         with h5py.File(path, "r") as f:
-            if "theta" not in f or "x" not in f:
-                raise ValueError(f"{path} does not contain top-level theta and x datasets")
-
-            theta = f["theta"]
-            x = f["x"]
-            lengths = f["lengths"] if "lengths" in f else None
-
-            if theta.ndim != 2:
-                raise ValueError(f"{path} theta dataset must be 2D, got shape {theta.shape}")
-            if x.ndim < 2:
-                raise ValueError(f"{path} x dataset must have sample axis plus feature dims, got {x.shape}")
-            if len(theta) != len(x):
-                raise ValueError(f"{path} has mismatched theta/x lengths: {len(theta)} vs {len(x)}")
-            if lengths is not None and len(lengths) != len(theta):
+            if "x" in f or any(name not in f for name in MERGE_DATASETS):
+                missing = [name for name in MERGE_DATASETS if name not in f]
                 raise ValueError(
-                    f"{path} has mismatched theta/lengths lengths: {len(theta)} vs {len(lengths)}"
+                    f"{path} is not a schema-v2 shard "
+                    f"(found 'x' dataset: {'x' in f}; missing: {missing or 'none'}). "
+                    f"merge_h5_shards.py requires the photon-level datasets "
+                    f"{MERGE_DATASETS} produced by the current generate_simulations.py."
                 )
 
-            current_theta_layout = DatasetLayout.from_dataset(theta)
-            current_x_layout = DatasetLayout.from_dataset(x)
-            current_lengths_layout = (
-                DatasetLayout.from_dataset(lengths) if lengths is not None else None
-            )
+            theta = f["theta"]
+            if theta.ndim != 2:
+                raise ValueError(f"{path} theta dataset must be 2D, got shape {theta.shape}")
 
-            if theta_layout is None:
-                theta_layout = current_theta_layout
-                x_layout = current_x_layout
-                lengths_layout = current_lengths_layout
-                lengths_reference_path = path if lengths is not None else None
+            n_samples = len(theta)
+            for name in MERGE_DATASETS:
+                if len(f[name]) != n_samples:
+                    raise ValueError(
+                        f"{path} has mismatched theta/{name} lengths: "
+                        f"{n_samples} vs {len(f[name])}"
+                    )
+
+            current_layouts = {name: DatasetLayout.from_dataset(f[name]) for name in MERGE_DATASETS}
+            current_attrs = read_format_attrs(f)
+
+            if layouts is None:
+                layouts = current_layouts
+                format_attrs = current_attrs
                 first_path = path
             else:
-                if current_theta_layout.tail_shape != theta_layout.tail_shape:
-                    raise ValueError(
-                        f"Theta shape mismatch in {path}: {current_theta_layout.tail_shape} "
-                        f"vs {theta_layout.tail_shape}"
-                    )
-                if current_x_layout.tail_shape != x_layout.tail_shape:
-                    raise ValueError(
-                        f"X shape mismatch in {path}: {current_x_layout.tail_shape} "
-                        f"vs {x_layout.tail_shape}"
-                    )
-                if current_theta_layout.dtype != theta_layout.dtype:
-                    raise ValueError(
-                        f"Theta dtype mismatch in {path}: {current_theta_layout.dtype} "
-                        f"vs {theta_layout.dtype}"
-                    )
-                if current_x_layout.dtype != x_layout.dtype:
-                    raise ValueError(
-                        f"X dtype mismatch in {path}: {current_x_layout.dtype} vs {x_layout.dtype}"
-                    )
-                if (current_lengths_layout is None) != (lengths_layout is None):
-                    has_path = lengths_reference_path if lengths_layout is not None else first_path
-                    missing_path = path if current_lengths_layout is None else has_path
-                    present_path = path if current_lengths_layout is not None else has_path
-                    raise ValueError(
-                        f"Cannot mix binding and equilibrium shards: {present_path} has a "
-                        f"'lengths' dataset but {missing_path} does not."
-                    )
-                if current_lengths_layout is not None and lengths_layout is not None:
-                    if current_lengths_layout.tail_shape != lengths_layout.tail_shape:
+                for name in MERGE_DATASETS:
+                    cur, ref = current_layouts[name], layouts[name]
+                    if cur.tail_shape != ref.tail_shape:
                         raise ValueError(
-                            f"Lengths shape mismatch in {path}: {current_lengths_layout.tail_shape} "
-                            f"vs {lengths_layout.tail_shape}"
+                            f"{name} shape mismatch in {path}: {cur.tail_shape} "
+                            f"vs {ref.tail_shape} (in {first_path})"
                         )
-                    if current_lengths_layout.dtype != lengths_layout.dtype:
+                    if cur.dtype != ref.dtype:
                         raise ValueError(
-                            f"Lengths dtype mismatch in {path}: {current_lengths_layout.dtype} "
-                            f"vs {lengths_layout.dtype}"
+                            f"{name} dtype mismatch in {path}: {cur.dtype} "
+                            f"vs {ref.dtype} (in {first_path})"
+                        )
+                for key in FORMAT_ATTRS:
+                    if current_attrs[key] != format_attrs[key]:
+                        raise ValueError(
+                            f"Attribute '{key}' mismatch in {path}: {current_attrs[key]} "
+                            f"vs {format_attrs[key]} (in {first_path}). "
+                            "Refusing to merge shards from incompatible runs."
                         )
 
-            shard_infos.append(ShardInfo(path=path, num_samples=len(theta)))
+            shard_infos.append(ShardInfo(path=path, num_samples=n_samples))
 
-    assert theta_layout is not None
-    assert x_layout is not None
-    return shard_infos, theta_layout, x_layout, lengths_layout
+    assert layouts is not None
+    assert format_attrs is not None
+    return shard_infos, layouts, format_attrs
 
 
 def validate_configs(shard_infos: list[ShardInfo]) -> None:
@@ -300,57 +307,31 @@ def write_bundle_files(
 def merge_shards(
     shard_infos: list[ShardInfo],
     output_path: Path,
-    theta_layout: DatasetLayout,
-    x_layout: DatasetLayout,
-    lengths_layout: DatasetLayout | None,
+    layouts: dict[str, DatasetLayout],
+    format_attrs: dict[str, Any],
     compression_override: int | None,
     max_batch_bytes: int,
 ) -> int:
     n_total = total_samples(shard_infos)
-    theta_dim = theta_layout.tail_shape[0]
-
-    theta_batch = rows_per_batch(theta_layout, max_batch_bytes)
-    x_batch = rows_per_batch(x_layout, max_batch_bytes)
-    lengths_batch = (
-        rows_per_batch(lengths_layout, max_batch_bytes)
-        if lengths_layout is not None
-        else None
-    )
+    batches = {name: rows_per_batch(layout, max_batch_bytes) for name, layout in layouts.items()}
 
     with h5py.File(output_path, "w", libver="latest") as out:
-        theta_ds = out.create_dataset(
-            "theta",
-            shape=(n_total, theta_dim),
-            maxshape=(n_total, theta_dim),
-            **create_dataset_kwargs(theta_layout, n_total, compression_override),
-        )
-        x_ds = out.create_dataset(
-            "x",
-            shape=(n_total,) + x_layout.tail_shape,
-            maxshape=(n_total,) + x_layout.tail_shape,
-            **create_dataset_kwargs(x_layout, n_total, compression_override),
-        )
-        lengths_ds = None
-        if lengths_layout is not None:
-            lengths_ds = out.create_dataset(
-                "lengths",
-                shape=(n_total,) + lengths_layout.tail_shape,
-                maxshape=(n_total,) + lengths_layout.tail_shape,
-                **create_dataset_kwargs(lengths_layout, n_total, compression_override),
+        for name, layout in layouts.items():
+            shape = (n_total,) + layout.tail_shape
+            out.create_dataset(
+                name,
+                shape=shape,
+                maxshape=shape,
+                **create_dataset_kwargs(layout, n_total, compression_override),
             )
 
         offset = 0
         with tqdm(total=len(shard_infos), unit="shard", desc="Merging shards") as pbar:
             for shard in shard_infos:
                 with h5py.File(shard.path, "r") as src:
-                    next_offset = offset + shard.num_samples
-                    stream_copy(src["theta"], theta_ds, offset, shard.num_samples, theta_batch)
-                    stream_copy(src["x"], x_ds, offset, shard.num_samples, x_batch)
-                    if lengths_ds is not None:
-                        stream_copy(
-                            src["lengths"], lengths_ds, offset, shard.num_samples, lengths_batch
-                        )
-                    offset = next_offset
+                    for name in layouts:
+                        stream_copy(src[name], out[name], offset, shard.num_samples, batches[name])
+                    offset += shard.num_samples
 
                 pbar.update(1)
                 pbar.set_postfix_str(f"{shard.path.parent.name} | samples={offset}/{n_total}")
@@ -358,12 +339,12 @@ def merge_shards(
         out.attrs["write_idx"] = offset
         out.attrs["num_simulations"] = offset
         out.attrs["generated_at"] = datetime.now().isoformat()
-        out.attrs["theta_shape"] = list(theta_ds.shape)
-        out.attrs["x_shape"] = list(x_ds.shape)
-        if lengths_ds is not None:
-            out.attrs["has_lengths"] = True
-            out.attrs["lengths_shape"] = list(lengths_ds.shape)
         out.attrs["source_shards"] = [str(shard.path) for shard in shard_infos]
+        for name in layouts:
+            out.attrs[f"{name}_shape"] = list(out[name].shape)
+        for key in FORMAT_ATTRS:
+            if format_attrs.get(key) is not None:
+                out.attrs[key] = format_attrs[key]
 
     return n_total
 
@@ -383,7 +364,7 @@ def main() -> None:
     if not shard_files:
         raise FileNotFoundError("No input shard files remain after excluding the output path.")
 
-    shard_infos, theta_layout, x_layout, lengths_layout = inspect_shards(shard_files)
+    shard_infos, layouts, format_attrs = inspect_shards(shard_files)
     validate_configs(shard_infos)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,9 +372,8 @@ def main() -> None:
     n_total = merge_shards(
         shard_infos=shard_infos,
         output_path=output_path,
-        theta_layout=theta_layout,
-        x_layout=x_layout,
-        lengths_layout=lengths_layout,
+        layouts=layouts,
+        format_attrs=format_attrs,
         compression_override=args.compression_opts,
         max_batch_bytes=args.max_batch_bytes,
     )

@@ -1,4 +1,4 @@
-from typing import Union, List
+from typing import Union, List, Sequence
 
 from sklearn.preprocessing import scale
 from omegaconf import OmegaConf
@@ -141,22 +141,50 @@ def assemble_canonical_theta(
     return out
 
 
+def _normalize_scale(scale, num_knots: int) -> List[float]:
+    """Broadcast a prior half-width into one positive value per knot.
+
+    ``scale`` may be a scalar (shared half-width for every knot) or a sequence
+    of length ``num_knots`` (a per-knot half-width). Returns a plain list of
+    floats so the caller can index it knot-by-knot.
+    """
+    if isinstance(scale, (int, float)):
+        scales = [float(scale)] * num_knots
+    else:
+        scales = [float(s) for s in scale]
+        if len(scales) != num_knots:
+            raise ValueError(
+                f"prior.scale has length {len(scales)} but num_knots={num_knots}; "
+                f"pass a scalar or a sequence of length {num_knots}."
+            )
+    if any(s <= 0.0 for s in scales):
+        raise ValueError(f"prior.scale entries must be positive; got {scales}")
+    return scales
+
+
 def generate_spline_prior(
-        centers: Union[torch.Tensor, None] = None, 
-        scale: float = 1.0, 
-        num_knots: int = 10, 
+        centers: Union[torch.Tensor, None] = None,
+        scale: Union[float, Sequence[float]] = 1.0,
+        num_knots: int = 10,
         device: str = "cpu"
     ) -> List[dists.Uniform]:
+    """Independent uniform prior per knot: g_i ~ U(center_i - s_i, center_i + s_i).
 
+    ``scale`` is either a scalar (same half-width ``s_i`` for every knot) or a
+    sequence of length ``num_knots`` giving a separate half-width per knot.
+    """
     if centers is None:
         centers = torch.zeros(num_knots)
-    
+
+    scales = _normalize_scale(scale, num_knots)
+
     prior_spline = [
         dists.Uniform(
-            torch.tensor(
-                [
-                    centers[i] - scale], device=device), torch.tensor([centers[i] + scale], device=device)) for i in range(num_knots)
-                ]
+            torch.tensor([centers[i] - scales[i]], device=device),
+            torch.tensor([centers[i] + scales[i]], device=device),
+        )
+        for i in range(num_knots)
+    ]
     return prior_spline
 
 def generate_spline_fret_prior(
@@ -171,7 +199,7 @@ def generate_spline_fret_prior(
     C_gr_lims: tuple = (0.0, 0.2),
     C_rg_lims: tuple = (0.0, 0.2),
     center: Union[torch.Tensor, List[float], None] = None,
-    scale: float = 1.0,
+    scale: Union[float, Sequence[float]] = 1.0,
     device: str = "cpu",
 ) -> MultipleIndependent:
     """
@@ -190,7 +218,8 @@ def generate_spline_fret_prior(
         logD_lims … C_rg_lims: (low, high) bounds for each parameter.
         center: Optional force template of length n (knot force values).
             None → flat, symmetric prior (zero mean force).
-        scale: Half-width per knot's uniform box.
+        scale: Half-width of each knot's uniform box. Either a scalar (shared
+            across all knots) or a length-n sequence for a per-knot half-width.
         device: Torch device.
 
     Examples
@@ -201,6 +230,10 @@ def generate_spline_fret_prior(
     Prior expecting a central restoring force (harmonic-like):
         >>> center = torch.tensor([4., 2., 0., -2., -4.])
         >>> prior = generate_spline_fret_prior(num_knots=5, scale=3.0, center=center)
+
+    Per-knot half-widths (tighter at the ends, looser in the middle):
+        >>> prior = generate_spline_fret_prior(
+        ...     num_knots=5, scale=[1., 2., 3., 2., 1.], center=center)
     """
     prior_logD = dists.Uniform(
         torch.tensor([logD_lims[0]], device=device),

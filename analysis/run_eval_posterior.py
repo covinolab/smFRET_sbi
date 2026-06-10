@@ -11,13 +11,15 @@ Given a trained-model output directory (the folder holding ``data_config.yaml`` 
 The **ground-truth nuisance parameters** (logD, R0, kD, k_gb, k_rb, eta_g, eta_r,
 C_gr, C_rg) are controlled with ``--set PARAM=VALUE`` and applied to every case. For
 each case it simulates one observation set, samples the posterior + finds the MAP, and
-saves the raw results (samples, MAP, ground truth, free energy) + the free-energy plot
-into ``<out-dir>/cases/<case>/``.
+saves the raw results into ``<out-dir>/cases/<case>/`` as three files — ``parameters.npz``
+(posterior samples), ``map_estimate.npz`` (the MAP + its free energy) and ``ground.npz``
+(the ground truth + its free energy) — plus the free-energy plot. Per-case scalar metrics
+(MAP value, parameter-distance accuracy, posterior entropy) live in ``run_meta.json``.
 
 This script does ONE thing: evaluate one posterior under one set of settings. Sweeps
 and multi-model comparisons are done by calling it MULTIPLE times (e.g. a kD sweep is a
 shell loop over ``--set kD=...`` with different ``--out-dir``) and loading the saved
-``posterior.npz`` files elsewhere.
+case files elsewhere.
 
 Everything physical (num_knots, priors, photophysics, simulator settings) is read from
 the model's ``data_config.yaml`` — nothing is hardcoded.
@@ -212,7 +214,7 @@ def prior_range_violations(ctx: Ctx, theta) -> list:
 
 
 def make_case(ctx: Ctx, name, knots, **overrides) -> dict:
-    """Build one ground-truth case -> dict(name, true_params, knots, in_support, violations).
+    """Build one ground-truth case -> dict(name, true_params, knots, in_support).
 
     ``knots`` is the raw knot-force vector (len == num_knots). ``**overrides`` set
     non-knot canonical params (the fixed nuisance ground truth, e.g. ``kD=300``). The
@@ -233,21 +235,11 @@ def make_case(ctx: Ctx, name, knots, **overrides) -> dict:
         theta[ci[key]] = float(val)
 
     violations = prior_range_violations(ctx, theta)
-    in_support = (len(violations) == 0)
     if violations:
         warnings.warn(f"[{name}] ground truth OUT OF PRIOR RANGE: " +
                       "; ".join(f"{n}={v:.4g} not in [{lo:.4g}, {hi:.4g}]"
                                 for n, v, lo, hi in violations))
-    return {"name": name, "true_params": theta, "knots": g,
-            "in_support": in_support, "violations": violations}
-
-
-def make_prior_sample_case(ctx: Ctx, name, theta: torch.Tensor) -> dict:
-    """Wrap a full canonical theta drawn from the prior into a case dict."""
-    theta = theta.detach().cpu().double()
-    g = theta[1:ctx.num_knots + 1].numpy().copy()
-    in_support = bool(within_support(ctx.prior_sim_cpu, theta.unsqueeze(0)).item())
-    return {"name": name, "true_params": theta, "knots": g, "in_support": in_support}
+    return {"name": name, "true_params": theta, "knots": g, "in_support": not violations}
 
 
 # =============================================================================
@@ -504,18 +496,31 @@ def plot_fe_comparison(ctx: Ctx, result, ax=None, n_band=300, hpd_frac=0.68):
     return ax
 
 
-def plot_pairplot(ctx: Ctx, result):
-    def _bounds(i):
-        if i == 0:
-            return list(ctx.data_cfg.prior.logD_lims)
-        if 1 <= i <= ctx.num_knots:
-            c = ctx.prior_center[i - 1]
-            s = ctx.prior_scale[i - 1]
-            return [float(c - s), float(c + s)]
-        name = PHYS_PARAM_NAMES[i - ctx.num_knots - 1]
-        return list(ctx.data_cfg.prior[f"{name}_lims"])
+def _inferred_bounds(ctx: Ctx):
+    """Per-inferred-dim prior (lo, hi) arrays in ``inferred_idx`` order.
 
-    limits = [_bounds(int(i)) for i in ctx.inferred_idx.tolist()]
+    ``logD`` -> ``logD_lims``; spline knots ``g_i`` -> per-knot box ``center_i ± scale_i``;
+    physical params -> their ``*_lims``. Pinned params (lims ``[a, a]``) give ``lo == hi``
+    (zero width). Used both for pairplot axis limits and for normalizing the accuracy /
+    precision metrics so heterogeneously-scaled parameters contribute comparably.
+    """
+    los, his = [], []
+    for i in ctx.inferred_idx.tolist():
+        if i == 0:
+            lo, hi = ctx.data_cfg.prior.logD_lims
+        elif 1 <= i <= ctx.num_knots:
+            c = ctx.prior_center[i - 1]; s = ctx.prior_scale[i - 1]
+            lo, hi = c - s, c + s
+        else:
+            name = PHYS_PARAM_NAMES[i - ctx.num_knots - 1]
+            lo, hi = ctx.data_cfg.prior[f"{name}_lims"]
+        los.append(float(lo)); his.append(float(hi))
+    return np.asarray(los, dtype=float), np.asarray(his, dtype=float)
+
+
+def plot_pairplot(ctx: Ctx, result):
+    lo, hi = _inferred_bounds(ctx)
+    limits = [[float(a), float(b)] for a, b in zip(lo, hi)]
     fig, _ = analysis.pairplot(
         result["samples"], figsize=(7, 7),
         points=[result["true_params"][ctx.inferred_idx].float(),
@@ -527,14 +532,36 @@ def plot_pairplot(ctx: Ctx, result):
     return fig
 
 
-def fe_rmse(ctx: Ctx, result) -> float:
-    map_canonical = to_canonical(ctx, result["map_estimate"][0].cpu())
-    _, y_map = ctx.eval_free_energy(params=map_canonical, x_eval=ctx.x_eval)
-    _, y_true = ctx.eval_free_energy(params=result["true_params"], x_eval=ctx.x_eval)
-    y_map = y_map - y_map.min()
-    y_true = y_true - y_true.min()
-    inner = (ctx.x_eval >= ctx.x_min) & (ctx.x_eval <= ctx.x_max)
-    return float(np.sqrt(np.mean((y_map[inner] - y_true[inner]) ** 2)))
+def compute_metrics(ctx: Ctx, result) -> dict:
+    """Per-case scalars: the MAP value, accuracy, and posterior confidence.
+
+    All in the inferred parameter subspace (``ctx.inferred_idx`` order, matching ``samples``,
+    the MAP, and ``true_params[inferred_idx]``).
+
+    map_logprob   : the NPE log-density at the MAP (the "MAP value").
+    param_dist_l2 : accuracy -- Euclidean distance ||theta_MAP - theta_true||.
+    H_post        : confidence -- posterior differential entropy, H_post = -mean(log q), from the
+                    NPE's per-sample log-probs. Smaller = tighter posterior. Compare against the
+                    model-constant prior entropy ``H_prior`` (saved once at the run level) for the
+                    prior->posterior volume ratio exp(H_post - H_prior).
+    """
+    map_theta = result["map_estimate"][0].detach().cpu().double().numpy()
+    true_inf = result["true_params"][ctx.inferred_idx].detach().double().numpy()
+    log_probs = result["log_probs"].detach().double().numpy()
+    return {
+        "map_logprob": float(result["map_estimate"][1]),
+        "param_dist_l2": float(np.linalg.norm(map_theta - true_inf)),
+        "H_post": float(-log_probs.mean()),
+    }
+
+
+def prior_entropy(ctx: Ctx) -> float:
+    """Differential entropy of the (uniform box) prior over the inferred dims: sum log(hi - lo).
+
+    A model constant (independent of the case), so it is computed once per run."""
+    lo, hi = _inferred_bounds(ctx)
+    width = hi - lo
+    return float(np.sum(np.log(width[width > 0])))
 
 
 # =============================================================================
@@ -555,24 +582,31 @@ def save_case_results(ctx: Ctx, case, result, case_dir: Path, args):
     except Exception as e:  # pairplot can be finicky; don't lose the run over a plot
         warnings.warn(f"[{case['name']}] pairplot failed: {e}")
 
-    # Numerical results.
+    # Raw arrays, split into three purpose-specific files. The scalar metrics
+    # (param_dist_l2, H_post, map_logprob) live in run_meta.json, not here.
     map_canonical = to_canonical(ctx, result["map_estimate"][0].cpu())
     _, U_map = ctx.eval_free_energy(params=map_canonical, x_eval=ctx.x_eval)
     _, U_true = ctx.eval_free_energy(params=result["true_params"], x_eval=ctx.x_eval)
+
     np.savez_compressed(
-        case_dir / "posterior.npz",
+        case_dir / "parameters.npz",            # the posterior samples
         samples=result["samples"].numpy(),
         log_probs=result["log_probs"].numpy(),
+        inferred_idx=ctx.inferred_idx.numpy(),
+        in_support=case["in_support"],
+    )
+    np.savez_compressed(
+        case_dir / "map_estimate.npz",          # the MAP point + its free-energy curve
         map_theta=result["map_estimate"][0].cpu().numpy(),
         map_logprob=float(result["map_estimate"][1]),
+        U_map=U_map - U_map.min(),
+    )
+    np.savez_compressed(
+        case_dir / "ground.npz",                # the ground truth + its free-energy curve
         true_params=case["true_params"].numpy(),
         knots=case["knots"],
-        inferred_idx=ctx.inferred_idx.numpy(),
         x_eval=ctx.x_eval,
-        U_map=U_map - U_map.min(),
         U_true=U_true - U_true.min(),
-        fe_rmse=fe_rmse(ctx, result),
-        in_support=case["in_support"],
     )
     if args.save_obs:
         np.save(case_dir / "observation.npy", result["obs"].numpy())
@@ -631,12 +665,8 @@ def _print_cases(label, cases):
     print(f"[cases] {label}")
     for c in cases:
         flag = "in range" if c["in_support"] else "OUT OF RANGE"
-        gt = {k: v for k, v in c["gt_nuisance"].items()}
-        line = f"   {c['name']:>30s}  [{flag:>12s}]  gt_nuisance={gt or '{}'}"
-        if c.get("violations"):
-            line += "  !! " + ", ".join(f"{n}={v:.4g}∉[{lo:.4g},{hi:.4g}]"
-                                        for n, v, lo, hi in c["violations"])
-        print(line)
+        gt = dict(c["gt_nuisance"])
+        print(f"   {c['name']:>30s}  [{flag:>12s}]  gt_nuisance={gt or '{}'}")
 
 
 def _result_from_case(ctx: Ctx, posterior, c, args, seed) -> dict:
@@ -773,6 +803,8 @@ def main(argv=None):
     results = []
     for c in cases:
         res = _result_from_case(ctx, posterior, c, args, seed)
+        # Metrics only make sense in support; leave them empty for out-of-range ground truth.
+        res["metrics"] = compute_metrics(ctx, res) if c["in_support"] else {}
         results.append(res)
         save_case_results(ctx, c, res, cases_dir / _safe(c["name"]), args)
 
@@ -786,24 +818,36 @@ def main(argv=None):
         ax.set_visible(False)
     fig.tight_layout(); fig.savefig(out_dir / "fe_comparison_grid.png", dpi=150); plt.close(fig)
 
-    # run_meta.json: the call's exact settings + per-case headline results.
-    rmses = {res["name"]: fe_rmse(ctx, res) for res in results}
+    # run_meta.json: the call's exact settings + per-case headline metrics. Out-of-support cases
+    # carry null metrics (metrics is {}); H_prior is a model constant, saved once at the top level.
+    by_name = {res["name"]: res["metrics"] for res in results}
+
+    def _case_meta(c):
+        m = by_name[c["name"]]
+        return {"name": c["name"], "in_support": c["in_support"],
+                "map_logprob": m.get("map_logprob"),
+                "param_dist_l2": m.get("param_dist_l2"),
+                "H_post": m.get("H_post")}
+
     meta = {
         "timestamp": timestamp, "model_dir": str(cfg_path), "data_config": ctx.data_cfg_path,
         "device": device, "mode": str(ctx.data_cfg.simulator.mode), "num_knots": ctx.num_knots,
         "n_obs": n_obs, "seed": seed, "inferred_labels": ctx.inferred_labels,
+        "H_prior": prior_entropy(ctx),
         "set": fixed, "n_prior_samples": args.n_prior_samples,
         "explicit_knots": [name for name, _ in knot_specs],
-        "cases": [{"name": c["name"], "in_support": c["in_support"],
-                   "violations": [list(v) for v in c.get("violations", [])],
-                   "fe_rmse_kBT": rmses[c["name"]]} for c in cases],
+        "cases": [_case_meta(c) for c in cases],
         "args": vars(args),
     }
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
-    print("\n[summary]  case / FE RMSE [kBT]")
+    print("\n[summary]  case / param_dist_l2 / H_post")
     for res in results:
-        print(f"   {res['name']:>30s}  {rmses[res['name']]:.3f}")
+        m = res["metrics"]
+        if m:
+            print(f"   {res['name']:>30s}  l2={m['param_dist_l2']:.3f}  H_post={m['H_post']:.3f}")
+        else:
+            print(f"   {res['name']:>30s}  (out of support — metrics skipped)")
     print(f"\nDone. Results in: {out_dir}")
     return out_dir
 

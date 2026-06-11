@@ -35,21 +35,25 @@ _worker_num_traces = 1
 _worker_max_traj_retries = 50
 _worker_inferred_idx = None
 _worker_nuisance_idx = None
+_worker_nuisance_per_set = False
 
 
 def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior,
                  num_traces=1, max_traj_retries=1,
-                 inferred_idx=None, nuisance_idx=None):
+                 inferred_idx=None, nuisance_idx=None,
+                 nuisance_per_set=False):
     """Initialise per-worker shared state (called once per pool worker)."""
     global _worker_sim_fn, _worker_nuisance_prior, _worker_out_queue
     global _worker_num_traces, _worker_max_traj_retries
     global _worker_inferred_idx, _worker_nuisance_idx
+    global _worker_nuisance_per_set
     _worker_nuisance_prior = nuisance_prior
     _worker_out_queue = out_queue
     _worker_num_traces = num_traces
     _worker_max_traj_retries = max_traj_retries
     _worker_inferred_idx = inferred_idx
     _worker_nuisance_idx = nuisance_idx
+    _worker_nuisance_per_set = nuisance_per_set
     _worker_sim_fn = partial(sim_fn, **sim_kwargs)
     np.random.seed(os.getpid() % (2**32))
     torch.set_num_threads(1)
@@ -61,7 +65,9 @@ def _worker_simulate_batch(batch_theta):
     Each simulator call returns (interphoton_times, channels, length) padded
     to N_max_photons. For set-based mode (num_traces_per_set > 1), each
     "simulation" stacks N traces; the inferred portion is shared across the
-    set while nuisance is resampled per trace.
+    set. Nuisance is resampled per trace by default; if ``nuisance_per_set`` is
+    set, the nuisance vector is drawn ONCE per set and shared across all traces
+    (matches a real measurement with one fixed detector/photophysics).
     """
     results_theta, results_ipt, results_chans, results_lengths = [], [], [], []
     N = _worker_num_traces
@@ -69,10 +75,16 @@ def _worker_simulate_batch(batch_theta):
     for i in range(len(batch_theta)):
         ipt_set, chans_set, lengths_set = [], [], []
         ok = True
+        # Per-SET nuisance: one draw shared by every trace in the set (and reused across
+        # retries — the simulator is stochastic, so retrying the same theta can still
+        # succeed). Per-TRACE (default): redraw inside the loop below.
+        set_nuisance = (_worker_nuisance_prior.sample((1,)).squeeze(0)
+                        if _worker_nuisance_per_set else None)
         for _ in range(N):
             result = None
             for _attempt in range(_worker_max_traj_retries):
-                nuisance = _worker_nuisance_prior.sample((1,)).squeeze(0)
+                nuisance = (set_nuisance if _worker_nuisance_per_set
+                            else _worker_nuisance_prior.sample((1,)).squeeze(0))
                 theta_for_sim = assemble_canonical_theta(
                     batch_theta[i], nuisance,
                     _worker_inferred_idx, _worker_nuisance_idx,
@@ -286,14 +298,15 @@ def _run_simulation_pool(prior, nuisance_prior, batch_size, num_workers,
                          written_counter, writer_process=None,
                          num_traces_per_set=1, max_traj_retries=1,
                          max_rounds=500,
-                         inferred_idx=None, nuisance_idx=None):
+                         inferred_idx=None, nuisance_idx=None,
+                         nuisance_per_set=False):
     """Run the worker pool, retrying until the simulation budget is met."""
     pool = mp.Pool(
         num_workers,
         initializer=_init_worker,
         initargs=(out_queue, sim_fn, sim_kwargs, nuisance_prior,
                   num_traces_per_set, max_traj_retries,
-                  inferred_idx, nuisance_idx),
+                  inferred_idx, nuisance_idx, nuisance_per_set),
     )
     total_simulated = 0
     round_num = 0
@@ -356,6 +369,7 @@ def generate_simulations(cfg, args):
 
     num_traces_per_set = int(cfg.data_generation.get("num_traces_per_set", 1))
     max_traj_retries = int(cfg.data_generation.get("max_traj_retries", 1))
+    nuisance_per_set = bool(cfg.data_generation.get("nuisance_per_set", False))
     n_max_photons = int(cfg.simulator.N_max_photons)
 
     prior, nuisance_prior, inferred_idx, nuisance_idx = (
@@ -402,8 +416,10 @@ def generate_simulations(cfg, args):
         print("Mode: equilibrium (per-photon arrival times)")
 
     if num_traces_per_set > 1:
+        _nuis_mode = ("nuisance drawn ONCE per set (shared across traces)"
+                      if nuisance_per_set else "per-trace nuisance resampling")
         print(f"Set-based mode: {num_traces_per_set} traces per set "
-              f"(shared inferred params, per-trace nuisance resampling)")
+              f"(shared inferred params, {_nuis_mode})")
     if max_traj_retries > 1:
         print(f"Per-trajectory retries: {max_traj_retries}")
 
@@ -445,6 +461,7 @@ def generate_simulations(cfg, args):
         num_traces_per_set=num_traces_per_set,
         max_traj_retries=max_traj_retries,
         inferred_idx=inferred_idx, nuisance_idx=nuisance_idx,
+        nuisance_per_set=nuisance_per_set,
     )
 
     # Signal writer to finish

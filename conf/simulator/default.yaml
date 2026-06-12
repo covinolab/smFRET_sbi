@@ -58,6 +58,8 @@ data_generation:
   batch_size: 100              # simulations per batch
   chunk_size: 128              # HDF5 chunk size (samples per chunk)
   num_traces_per_set: 1        # iid traces per parameter set (1 = single-trace mode)
+  nuisance_per_set: false      # true = draw nuisance ONCE per set (shared across traces, like a fixed detector); false = resample per trace
+  nuisance_per_trace_params: []  # nuisance params kept per-trace even when nuisance_per_set=true (e.g. ["kD"]); empty = no exceptions
 
 output:
   directory: ./data/base            # output directory for training data

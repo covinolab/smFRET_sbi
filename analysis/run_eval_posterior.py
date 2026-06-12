@@ -333,24 +333,60 @@ def fret_simulator(params):
     return _arrivals_to_x_single(ipt, chans, length)
 
 
-def build_observation(pool, true_params, n_obs, n_pool, max_attempts=None):
+def build_observation(pool, true_params, n_obs, n_pool, max_attempts=None, theta_sampler=None):
     """Simulate via the pool in batches until ``n_obs`` successes -> (1, n_obs, N_max, 4).
 
-    Every trace in the set shares the same ``true_params`` (the case's fixed ground
-    truth). Sim-failure rates vary a lot between ground-truth shapes, so we top up in
-    batches of ``n_pool`` (reusing the same pool — never re-forking) until enough traces
-    succeed or ``max_attempts`` is hit.
+    ``theta_sampler`` controls the per-set nuisance handling:
+      * ``None`` (per-SET): every trace shares the same ``true_params`` (the case's fixed
+        ground truth) — matches a model trained with one fixed nuisance per set.
+      * a callable (per-TRACE): each trace gets a fresh theta from ``theta_sampler()`` (the
+        landscape + pinned nuisance held fixed, the rest of the nuisance redrawn) — matches
+        a model trained with nuisance resampled per trace.
+
+    Sim-failure rates vary a lot between ground-truth shapes, so we top up in batches of
+    ``n_pool`` (reusing the same pool — never re-forking) until enough traces succeed or
+    ``max_attempts`` is hit.
     """
     max_attempts = max_attempts if max_attempts is not None else n_pool * 8
     results, attempts = [], 0
     while len(results) < n_obs and attempts < max_attempts:
-        batch = pool.map(fret_simulator, [true_params] * n_pool)
+        thetas = ([true_params] * n_pool if theta_sampler is None
+                  else [theta_sampler() for _ in range(n_pool)])
+        batch = pool.map(fret_simulator, thetas)
         attempts += n_pool
         results.extend(r for r in batch if r is not None)
     if len(results) < n_obs:
         raise RuntimeError(f"Only {len(results)}/{n_obs} simulations succeeded in {attempts} "
                            f"attempts; increase --n-simulations-pool or --max-sim-attempts.")
     return torch.stack(results[:n_obs]).unsqueeze(0)  # (1, n_obs, N_max, 4)
+
+
+def _nuisance_resample_idx(ctx: Ctx, gt_nuisance=None) -> torch.Tensor:
+    """Canonical nuisance dims to resample per trace = all nuisance dims minus the
+    user-pinned ones (``gt_nuisance`` from ``--set``). Inferred dims are never resampled
+    (they are the landscape under test, held fixed across the set)."""
+    inferred = set(ctx.inferred_idx.tolist())
+    nuisance = [i for i in range(ctx.canonical_dim) if i not in inferred]
+    ci = canonical_index(ctx)
+    pinned = {ci[n] for n in (gt_nuisance or {}) if n in ci}
+    return torch.tensor([i for i in nuisance if i not in pinned], dtype=torch.long)
+
+
+def _make_theta_sampler(ctx: Ctx, true_params, resample_idx):
+    """Per-trace theta sampler: the case's params, with the unpinned nuisance dims redrawn
+    from the model prior on each call (matches per-trace training). Returns CPU tensors."""
+    base = true_params.detach().cpu().clone()
+    ridx = resample_idx
+
+    def _sample():
+        if ridx.numel() == 0:
+            return base.clone()
+        s = ctx.prior_sim_cpu.sample((1,))[0].to(base.dtype)
+        t = base.clone()
+        t[ridx] = s[ridx]
+        return t
+
+    return _sample
 
 
 # =============================================================================
@@ -737,6 +773,15 @@ def parse_args(argv=None):
                    help="Seed for posterior sampling + prior-sample draws (use -1 to stay stochastic). "
                         "NOTE: simulated photons are PID-seeded per worker and not bit-reproducible.")
     p.add_argument("--save-obs", action="store_true", help="Also save the raw observation tensors (large).")
+    # Per-set vs per-trace nuisance when building observations. Default (None) reads
+    # data_generation.nuisance_per_set from the model's data_config.yaml so the eval
+    # matches how the model was trained.
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--nuisance-per-set", dest="nuisance_per_set", action="store_const", const=True,
+                   help="Build each observation set with ONE fixed nuisance shared across all traces.")
+    g.add_argument("--nuisance-per-trace", dest="nuisance_per_set", action="store_const", const=False,
+                   help="Resample unpinned nuisance per trace (matches per-trace-trained models).")
+    p.set_defaults(nuisance_per_set=None)
     return p.parse_args(argv)
 
 
@@ -785,14 +830,27 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[output] {out_dir}")
 
+    # Per-set vs per-trace nuisance for observation building (default: match the model's
+    # training, read from data_config.yaml). Per-trace resamples the unpinned nuisance per
+    # trace; --set-pinned nuisance and the inferred landscape stay fixed across the set.
+    _dg = ctx.data_cfg.get("data_generation", {})
+    cfg_nps = bool(_dg.get("nuisance_per_set", False)) if _dg else False
+    nuisance_per_set = args.nuisance_per_set if args.nuisance_per_set is not None else cfg_nps
+    _src = "CLI" if args.nuisance_per_set is not None else "data_config"
+    print(f"[setup] nuisance: {'per-set (fixed across traces)' if nuisance_per_set else 'per-trace (unpinned resampled)'} [{_src}]")
+
     # ── Phase A: simulate ALL observations, then close the pool BEFORE any CUDA work.
     print(f"[simulate] {len(cases)} cases x {n_obs} obs ({args.n_sim_workers} workers) ...")
     _FRET_SIMULATOR = _make_simulator(ctx)
     pool = Pool(processes=args.n_sim_workers, initializer=_init_worker, initargs=((seed or 0),))
     try:
         for c in cases:
+            sampler = (None if nuisance_per_set
+                       else _make_theta_sampler(ctx, c["true_params"],
+                                                 _nuisance_resample_idx(ctx, c.get("gt_nuisance"))))
             c["obs"] = build_observation(pool, c["true_params"], n_obs,
-                                         args.n_simulations_pool, args.max_sim_attempts)
+                                         args.n_simulations_pool, args.max_sim_attempts,
+                                         theta_sampler=sampler)
             print(f"   {c['name']}: obs {tuple(c['obs'].shape)}")
     finally:
         pool.close(); pool.join()
@@ -833,7 +891,7 @@ def main(argv=None):
         "timestamp": timestamp, "model_dir": str(cfg_path), "data_config": ctx.data_cfg_path,
         "device": device, "mode": str(ctx.data_cfg.simulator.mode), "num_knots": ctx.num_knots,
         "n_obs": n_obs, "seed": seed, "inferred_labels": ctx.inferred_labels,
-        "H_prior": prior_entropy(ctx),
+        "H_prior": prior_entropy(ctx), "nuisance_per_set": nuisance_per_set,
         "set": fixed, "n_prior_samples": args.n_prior_samples,
         "explicit_knots": [name for name, _ in knot_specs],
         "cases": [_case_meta(c) for c in cases],

@@ -22,6 +22,7 @@ from simulator import binding_simulator_wrapper as binding_simulator
 from priors import (
     generate_split_priors_from_config,
     assemble_canonical_theta,
+    PHYS_PARAM_NAMES,
 )
 from utils import _validate_bc
 
@@ -36,17 +37,18 @@ _worker_max_traj_retries = 50
 _worker_inferred_idx = None
 _worker_nuisance_idx = None
 _worker_nuisance_per_set = False
+_worker_per_trace_nuisance_pos = None   # LongTensor of nuisance-vector slots to redraw per trace
 
 
 def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior,
                  num_traces=1, max_traj_retries=1,
                  inferred_idx=None, nuisance_idx=None,
-                 nuisance_per_set=False):
+                 nuisance_per_set=False, per_trace_nuisance_pos=None):
     """Initialise per-worker shared state (called once per pool worker)."""
     global _worker_sim_fn, _worker_nuisance_prior, _worker_out_queue
     global _worker_num_traces, _worker_max_traj_retries
     global _worker_inferred_idx, _worker_nuisance_idx
-    global _worker_nuisance_per_set
+    global _worker_nuisance_per_set, _worker_per_trace_nuisance_pos
     _worker_nuisance_prior = nuisance_prior
     _worker_out_queue = out_queue
     _worker_num_traces = num_traces
@@ -54,6 +56,7 @@ def _init_worker(out_queue, sim_fn, sim_kwargs, nuisance_prior,
     _worker_inferred_idx = inferred_idx
     _worker_nuisance_idx = nuisance_idx
     _worker_nuisance_per_set = nuisance_per_set
+    _worker_per_trace_nuisance_pos = per_trace_nuisance_pos
     _worker_sim_fn = partial(sim_fn, **sim_kwargs)
     np.random.seed(os.getpid() % (2**32))
     torch.set_num_threads(1)
@@ -67,7 +70,10 @@ def _worker_simulate_batch(batch_theta):
     "simulation" stacks N traces; the inferred portion is shared across the
     set. Nuisance is resampled per trace by default; if ``nuisance_per_set`` is
     set, the nuisance vector is drawn ONCE per set and shared across all traces
-    (matches a real measurement with one fixed detector/photophysics).
+    (matches a real measurement with one fixed detector/photophysics). Slots in
+    ``_worker_per_trace_nuisance_pos`` (e.g. kD) are exempted: even under
+    ``nuisance_per_set`` they are redrawn per trace, since they vary molecule to
+    molecule rather than being fixed by the apparatus.
     """
     results_theta, results_ipt, results_chans, results_lengths = [], [], [], []
     N = _worker_num_traces
@@ -77,14 +83,23 @@ def _worker_simulate_batch(batch_theta):
         ok = True
         # Per-SET nuisance: one draw shared by every trace in the set (and reused across
         # retries — the simulator is stochastic, so retrying the same theta can still
-        # succeed). Per-TRACE (default): redraw inside the loop below.
+        # succeed). Per-TRACE (default): redraw inside the loop below. Slots in
+        # _worker_per_trace_nuisance_pos (e.g. kD) are redrawn per trace even under
+        # per-set, by overwriting just those slots in a clone of the shared draw.
         set_nuisance = (_worker_nuisance_prior.sample((1,)).squeeze(0)
                         if _worker_nuisance_per_set else None)
         for _ in range(N):
             result = None
             for _attempt in range(_worker_max_traj_retries):
-                nuisance = (set_nuisance if _worker_nuisance_per_set
-                            else _worker_nuisance_prior.sample((1,)).squeeze(0))
+                if _worker_nuisance_per_set:
+                    nuisance = set_nuisance
+                    pos = _worker_per_trace_nuisance_pos
+                    if pos is not None and len(pos) > 0:
+                        nuisance = set_nuisance.clone()
+                        fresh = _worker_nuisance_prior.sample((1,)).squeeze(0)
+                        nuisance[pos] = fresh[pos]   # redraw kD (etc.) per trace
+                else:
+                    nuisance = _worker_nuisance_prior.sample((1,)).squeeze(0)
                 theta_for_sim = assemble_canonical_theta(
                     batch_theta[i], nuisance,
                     _worker_inferred_idx, _worker_nuisance_idx,
@@ -299,14 +314,15 @@ def _run_simulation_pool(prior, nuisance_prior, batch_size, num_workers,
                          num_traces_per_set=1, max_traj_retries=1,
                          max_rounds=500,
                          inferred_idx=None, nuisance_idx=None,
-                         nuisance_per_set=False):
+                         nuisance_per_set=False, per_trace_nuisance_pos=None):
     """Run the worker pool, retrying until the simulation budget is met."""
     pool = mp.Pool(
         num_workers,
         initializer=_init_worker,
         initargs=(out_queue, sim_fn, sim_kwargs, nuisance_prior,
                   num_traces_per_set, max_traj_retries,
-                  inferred_idx, nuisance_idx, nuisance_per_set),
+                  inferred_idx, nuisance_idx, nuisance_per_set,
+                  per_trace_nuisance_pos),
     )
     total_simulated = 0
     round_num = 0
@@ -357,6 +373,40 @@ def _run_simulation_pool(prior, nuisance_prior, batch_size, num_workers,
     return total_simulated, sim_bar, write_bar
 
 
+def _resolve_per_trace_nuisance_pos(names, nuisance_idx, num_knots):
+    """Names of per-trace nuisance params -> their positions within the nuisance
+    sample vector.
+
+    The nuisance sample vector is ordered like ``nuisance_idx`` (canonical theta
+    positions). A physics nuisance ``name`` sits at canonical position
+    ``num_knots + 1 + PHYS_PARAM_NAMES.index(name)``; its slot in the nuisance
+    vector is where that canonical position appears in ``nuisance_idx``.
+
+    Skips (with a warning) any name that isn't actually a nuisance (e.g. it's
+    being inferred, so it's shared across the set by construction). Returns None
+    if nothing applies.
+    """
+    if not names:
+        return None
+    nuis_list = nuisance_idx.tolist()
+    positions = []
+    for name in names:
+        if name not in PHYS_PARAM_NAMES:
+            raise ValueError(
+                f"nuisance_per_trace_params entry {name!r} is not a physics "
+                f"nuisance param. Valid: {PHYS_PARAM_NAMES}"
+            )
+        canonical_pos = num_knots + 1 + PHYS_PARAM_NAMES.index(name)
+        if canonical_pos not in nuis_list:
+            logger.warning(
+                "nuisance_per_trace_params: %r not in nuisance set "
+                "(likely inferred); ignoring.", name
+            )
+            continue
+        positions.append(nuis_list.index(canonical_pos))
+    return torch.tensor(sorted(positions), dtype=torch.long) if positions else None
+
+
 def generate_simulations(cfg, args):
     """Generate simulations using a queue-based writer pattern.
 
@@ -376,6 +426,12 @@ def generate_simulations(cfg, args):
         generate_split_priors_from_config(cfg, device="cpu")
     )
     theta_dim = int(inferred_idx.numel())
+
+    # Nuisance params that stay per-trace even under nuisance_per_set (e.g. kD).
+    per_trace_names = list(cfg.data_generation.get("nuisance_per_trace_params", []) or [])
+    per_trace_nuisance_pos = _resolve_per_trace_nuisance_pos(
+        per_trace_names, nuisance_idx, int(cfg.prior.num_knots)
+    )
 
     # Mode dispatch — build sim_fn and sim_kwargs
     mode = str(cfg.simulator.get("mode", "equilibrium")).lower()
@@ -416,8 +472,14 @@ def generate_simulations(cfg, args):
         print("Mode: equilibrium (per-photon arrival times)")
 
     if num_traces_per_set > 1:
-        _nuis_mode = ("nuisance drawn ONCE per set (shared across traces)"
-                      if nuisance_per_set else "per-trace nuisance resampling")
+        if nuisance_per_set:
+            if per_trace_nuisance_pos is not None:
+                _nuis_mode = (f"nuisance drawn ONCE per set, except {per_trace_names} "
+                              f"redrawn per trace")
+            else:
+                _nuis_mode = "nuisance drawn ONCE per set (shared across traces)"
+        else:
+            _nuis_mode = "per-trace nuisance resampling"
         print(f"Set-based mode: {num_traces_per_set} traces per set "
               f"(shared inferred params, {_nuis_mode})")
     if max_traj_retries > 1:
@@ -462,6 +524,7 @@ def generate_simulations(cfg, args):
         max_traj_retries=max_traj_retries,
         inferred_idx=inferred_idx, nuisance_idx=nuisance_idx,
         nuisance_per_set=nuisance_per_set,
+        per_trace_nuisance_pos=per_trace_nuisance_pos,
     )
 
     # Signal writer to finish

@@ -20,6 +20,8 @@ from torch import nn
 
 from gsl_spline import eval_spline, integrate_spline
 
+logger = logging.getLogger(__name__)
+
 
 def git_commit(repo_dir: Path) -> str:
     try:
@@ -263,6 +265,98 @@ def _validate_bc(bc, allow_open=True):
                 f"particles with an open boundary)"
             )
     return left, right
+
+
+def check_config_consistency(cfg):
+    """Validate logical self-consistency of the inferred / nuisance config keys.
+
+    Catches contradictions between ``prior.inferred_params`` and
+    ``data_generation.nuisance_per_trace_params`` (the per-set/per-trace knobs),
+    plus settings that are valid but have no effect.
+
+    Raises
+    ------
+    ValueError
+        On any hard contradiction:
+          * a param listed in BOTH ``prior.inferred_params`` and
+            ``data_generation.nuisance_per_trace_params`` (an inferred param is
+            shared across the set and learned — it cannot also be a per-trace
+            nuisance);
+          * an unknown token in ``nuisance_per_trace_params`` (not a physics
+            nuisance, e.g. a typo or ``logD``/``knots``);
+          * duplicate entries in ``nuisance_per_trace_params``.
+
+    Logs a warning (does not raise) for no-op settings:
+          * ``nuisance_per_trace_params`` set while ``nuisance_per_set`` is false;
+          * ``nuisance_per_trace_params`` set while ``num_traces_per_set <= 1``;
+          * ``nuisance_per_set`` true while ``num_traces_per_set <= 1``.
+
+    Returns
+    -------
+    list[str]
+        The warning messages that were emitted (empty if none).
+    """
+    from priors import PHYS_PARAM_NAMES, DEFAULT_INFERRED  # local import avoids any import cycle
+
+    cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
+
+    prior_cfg = cfg.get("prior", {}) or {}
+    dgen = cfg.get("data_generation", {}) or {}
+
+    inferred = list(prior_cfg.get("inferred_params", None) or DEFAULT_INFERRED)
+    per_trace = list(dgen.get("nuisance_per_trace_params", None) or [])
+    nuisance_per_set = bool(dgen.get("nuisance_per_set", False))
+    num_traces_per_set = int(dgen.get("num_traces_per_set", 1))
+
+    errors, warns = [], []
+
+    # 1. unknown tokens in nuisance_per_trace_params (must be physics nuisances)
+    bad = [p for p in per_trace if p not in PHYS_PARAM_NAMES]
+    if bad:
+        errors.append(
+            f"nuisance_per_trace_params contains non-physics-nuisance token(s) {bad}; "
+            f"valid options are {PHYS_PARAM_NAMES}."
+        )
+
+    # 2. duplicates in nuisance_per_trace_params
+    dupes = sorted({p for p in per_trace if per_trace.count(p) > 1})
+    if dupes:
+        errors.append(f"nuisance_per_trace_params has duplicate entries: {dupes}.")
+
+    # 3. a param cannot be both inferred and a per-trace nuisance
+    both = [p for p in per_trace if p in set(inferred)]
+    if both:
+        errors.append(
+            f"param(s) {both} appear in BOTH prior.inferred_params and "
+            f"data_generation.nuisance_per_trace_params. An inferred param is shared "
+            f"across a set and learned, so it cannot also be a per-trace nuisance — "
+            f"remove it from one of the two lists."
+        )
+
+    # 4. no-op settings (valid, but have no effect) -> warn only
+    if per_trace and not nuisance_per_set:
+        warns.append(
+            "nuisance_per_trace_params is set but nuisance_per_set is false; every "
+            "nuisance is already drawn per trace, so the list has no effect."
+        )
+    if per_trace and num_traces_per_set <= 1:
+        warns.append(
+            "nuisance_per_trace_params is set but num_traces_per_set <= 1 (single-trace "
+            "mode); per-set vs per-trace nuisance is moot, so the list has no effect."
+        )
+    if nuisance_per_set and num_traces_per_set <= 1:
+        warns.append(
+            "nuisance_per_set is true but num_traces_per_set <= 1; with one trace per "
+            "set there is nothing to share a nuisance across."
+        )
+
+    if errors:
+        raise ValueError(
+            "Config self-consistency check failed:\n  - " + "\n  - ".join(errors)
+        )
+    for w in warns:
+        logger.warning("config consistency: %s", w)
+    return warns
 
 
 def _boundary_slots(edge_value, direction, bc, max_force, N):

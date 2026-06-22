@@ -24,7 +24,7 @@ from priors import (
     assemble_canonical_theta,
     PHYS_PARAM_NAMES,
 )
-from utils import _validate_bc
+from utils import _validate_bc, check_config_consistency
 
 
 # ── Multiprocessing workers ─────────────────────────────────────────────────
@@ -585,6 +585,7 @@ def main():
 
     print(f"Loading config from: {config_path}")
     config = OmegaConf.load(config_path)
+    check_config_consistency(config)
 
     h5_path, actual_count, output_dir = generate_simulations(config, args)
     save_metadata(output_dir, config, str(config_path), args, actual_count, h5_path)

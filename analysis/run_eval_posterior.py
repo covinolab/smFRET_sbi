@@ -108,6 +108,11 @@ class Ctx:
     # prior box (per-knot aware)
     prior_center: np.ndarray
     prior_scale: np.ndarray
+    # knot prior mode: 'independent' (uniform box) or 'gaussian' (RBF MVN). Under
+    # 'gaussian' the knot prior is unbounded, so the OOD box widens to center +/-
+    # n_sigma * scale (scale is the marginal std).
+    knot_prior: str = "independent"
+    n_sigma: float = 3.0
     # set in phase B
     density_estimator: Any = None
     inferred_prior: Any = None
@@ -145,6 +150,9 @@ def build_context(cfg_path: str, device: str) -> Ctx:
     # Per-knot half-widths (scalar configs broadcast to a uniform array).
     prior_scale = np.asarray(_normalize_scale(data_cfg.prior.scale, num_knots), dtype=float)
 
+    knot_prior = str(data_cfg.prior.get("knot_prior", "independent"))
+    n_sigma = float(data_cfg.prior.get("n_sigma", 3.0))
+
     return Ctx(
         data_cfg=data_cfg, data_cfg_path=data_cfg_path, device=device,
         prior_sim_cpu=prior_sim_cpu, inferred_idx=inferred_idx, inferred_labels=inferred_labels,
@@ -152,6 +160,7 @@ def build_context(cfg_path: str, device: str) -> Ctx:
         num_knots=num_knots, canonical_dim=canonical_dim, theta_dim=theta_dim,
         x_min=x_min, x_max=x_max, knot_x=knot_x, x_eval=x_eval,
         prior_center=prior_center, prior_scale=prior_scale,
+        knot_prior=knot_prior, n_sigma=n_sigma,
     )
 
 
@@ -200,9 +209,11 @@ def prior_range_violations(ctx: Ctx, theta) -> list:
     lo, hi = (float(x) for x in ctx.data_cfg.prior.logD_lims)
     if not (lo <= th[0] <= hi):
         out.append(("logD", float(th[0]), lo, hi))
+    # Gaussian knot prior is unbounded; use center +/- n_sigma*scale as the effective box.
+    half = ctx.n_sigma if getattr(ctx, "knot_prior", "independent") == "gaussian" else 1.0
     for i in range(ctx.num_knots):
-        lo = float(ctx.prior_center[i] - ctx.prior_scale[i])
-        hi = float(ctx.prior_center[i] + ctx.prior_scale[i])
+        lo = float(ctx.prior_center[i] - half * ctx.prior_scale[i])
+        hi = float(ctx.prior_center[i] + half * ctx.prior_scale[i])
         if not (lo <= th[1 + i] <= hi):
             out.append((f"g{i}", float(th[1 + i]), lo, hi))
     for j, nm in enumerate(PHYS_PARAM_NAMES):
@@ -361,15 +372,24 @@ def build_observation(pool, true_params, n_obs, n_pool, max_attempts=None, theta
     return torch.stack(results[:n_obs]).unsqueeze(0)  # (1, n_obs, N_max, 4)
 
 
-def _nuisance_resample_idx(ctx: Ctx, gt_nuisance=None) -> torch.Tensor:
-    """Canonical nuisance dims to resample per trace = all nuisance dims minus the
-    user-pinned ones (``gt_nuisance`` from ``--set``). Inferred dims are never resampled
-    (they are the landscape under test, held fixed across the set)."""
+def _nuisance_resample_idx(ctx: Ctx, want="ALL", gt_nuisance=None) -> torch.Tensor:
+    """Canonical nuisance dims to resample per trace.
+
+    ``want`` selects which nuisance to vary per trace: ``"ALL"`` (full per-trace, PT mode)
+    or an iterable of param names (PTkD mode, e.g. ``["kD"]``). The result is always
+    intersected with the actual nuisance dims and has the user-pinned (``--set``) dims and
+    the inferred landscape removed (those stay fixed across the set). PS mode passes an
+    empty ``want`` -> empty tensor.
+    """
     inferred = set(ctx.inferred_idx.tolist())
     nuisance = [i for i in range(ctx.canonical_dim) if i not in inferred]
     ci = canonical_index(ctx)
+    if want == "ALL":
+        want_idx = set(nuisance)
+    else:
+        want_idx = {ci[n] for n in (want or []) if n in ci}
     pinned = {ci[n] for n in (gt_nuisance or {}) if n in ci}
-    return torch.tensor([i for i in nuisance if i not in pinned], dtype=torch.long)
+    return torch.tensor(sorted((want_idx & set(nuisance)) - pinned), dtype=torch.long)
 
 
 def _make_theta_sampler(ctx: Ctx, true_params, resample_idx):
@@ -398,43 +418,92 @@ def to_canonical(ctx: Ctx, theta_inferred: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def infer_posterior(ctx: Ctx, posterior, obs, args, show_progress=True) -> dict:
-    """Sample the posterior, score the samples, find the MAP."""
-    obs = obs.to(ctx.device)
-    samples = posterior.sample(
-        (args.num_posterior_samples,), x=obs,
-        max_sampling_batch_size=args.posterior_batch_size,
-        show_progress_bars=show_progress,
-    ).cpu()
+def _bounded_sample(ctx: Ctx, obs, num_samples, batch, max_oversample=20,
+                    giveup_proposals=2000):
+    """Rejection-sample the posterior with a HARD proposal cap so it can never hang.
 
-    samples_dev = samples.to(ctx.device)
-    log_probs = []
+    ``DirectPosterior.sample`` loops forever when the posterior leaks out of the prior box
+    (the ``0.000% proposal samples accepted`` failure). Here we draw raw flow samples
+    directly (``density_estimator.sample(condition=...)``), keep the in-support ones, and
+    stop as soon as ``num_samples`` are collected OR ``num_samples * max_oversample``
+    proposals are spent. We also give up early if NOTHING is accepted after
+    ``giveup_proposals`` proposals. Returns ``(samples_cpu, acceptance, complete, n_proposals)``.
+
+    Note: under a Gaussian knot prior (``knot_prior='gaussian'``) the prior support is
+    unbounded, so ``within_support`` accepts every knot value and this becomes a harmless
+    pass-through (which also side-steps the leakage-stall entirely). Non-knot uniform
+    dims (logD, physics) are still rejection-checked as before.
+    """
+    de = ctx.density_estimator
+    x = obs.to(ctx.device)
+    max_prop = max(int(num_samples * max_oversample), batch)
+    kept, n_prop, n_kept = [], 0, 0
     with torch.no_grad():
-        rng = range(0, samples_dev.shape[0], args.log_prob_batch_size)
-        for start in (tqdm(rng, desc="log_prob", leave=False) if show_progress else rng):
-            chunk = samples_dev[start:start + args.log_prob_batch_size]
-            # norm_posterior=False: skip the (rejection-based) leakage correction — we
-            # only use these log-probs RELATIVELY (top-k seeding + HPD band quantile), and
-            # the correction explodes when the posterior leaks out of the prior support.
-            log_probs.append(posterior.log_prob(chunk, x=obs, norm_posterior=False).cpu())
-    log_probs = torch.cat(log_probs)
+        while n_kept < num_samples and n_prop < max_prop:
+            s = de.sample((batch,), condition=x).reshape(-1, ctx.theta_dim)
+            n_prop += s.shape[0]
+            ins = within_support(ctx.inferred_prior, s)
+            if bool(ins.any()):
+                sk = s[ins].cpu()
+                kept.append(sk); n_kept += sk.shape[0]
+            if n_kept == 0 and n_prop >= giveup_proposals:
+                break
+    samples = torch.cat(kept)[:num_samples] if kept else torch.empty((0, ctx.theta_dim))
+    acc = (n_kept / n_prop) if n_prop else 0.0
+    return samples, float(acc), bool(samples.shape[0] >= num_samples), int(n_prop)
 
-    k = min(args.top_k, samples.shape[0])
-    top_samples = samples[torch.topk(log_probs, k=k).indices]
 
-    # MAP initialization. Default ("top_k") seeds a multi-start gradient ascent from the
-    # top-log-prob samples. "posterior_mean" starts a SINGLE optimization at the posterior
-    # sample mean (the mean of the in-support posterior samples). For a roughly unimodal
-    # posterior this lands in the same basin far more cheaply (1 trajectory vs top_k).
-    if args.map_init == "posterior_mean":
+def infer_posterior(ctx: Ctx, posterior, obs, args, show_progress=True) -> dict:
+    """Sample the posterior (bounded — never hangs), score the samples, find the MAP.
+
+    Uses ``_bounded_sample`` instead of ``DirectPosterior.sample`` so a leaked/OOD posterior
+    is flagged (``leaked=True``, low ``acceptance``) and the run continues rather than
+    hanging at 0% acceptance. The MAP is still computed (support-aware optimiser; prior-init
+    when no in-support samples were collected).
+    """
+    obs = obs.to(ctx.device)
+    max_oversample = getattr(args, "max_oversample", 20)
+    giveup = getattr(args, "sample_giveup_proposals", 2000)
+    samples, acceptance, complete, n_prop = _bounded_sample(
+        ctx, obs, args.num_posterior_samples, args.posterior_batch_size,
+        max_oversample=max_oversample, giveup_proposals=giveup)
+    n_samp = int(samples.shape[0])
+    # leaked = couldn't collect the full requested set within the proposal cap (acceptance
+    # below ~1/max_oversample) -> the posterior is leaking out of the prior box (OOD).
+    leaked = (n_samp < args.num_posterior_samples)
+    if leaked:
+        warnings.warn(f"posterior acceptance {acceptance:.3%}: collected {n_samp}/"
+                      f"{args.num_posterior_samples} in-support samples in {n_prop} proposals "
+                      f"(cap hit) -> case flagged LEAKED"
+                      + ("; no in-support samples, MAP from prior init." if n_samp == 0
+                         else "; using the partial set."))
+
+    # log_prob on the collected samples (relative use only; norm_posterior=False).
+    log_probs = torch.empty(0)
+    if n_samp > 0:
+        samples_dev = samples.to(ctx.device)
+        lps = []
+        with torch.no_grad():
+            rng = range(0, n_samp, args.log_prob_batch_size)
+            for start in (tqdm(rng, desc="log_prob", leave=False) if show_progress else rng):
+                chunk = samples_dev[start:start + args.log_prob_batch_size]
+                lps.append(posterior.log_prob(chunk, x=obs, norm_posterior=False).cpu())
+        log_probs = torch.cat(lps)
+
+    # MAP initialization (support-aware optimiser). With no in-support samples we multi-start
+    # from prior draws so the MAP still climbs to the in-support mode.
+    if n_samp == 0:
+        init_samples = ctx.inferred_prior.sample((min(args.top_k, 100),)).cpu()
+        n_init = n_opt = int(init_samples.shape[0])
+    elif args.map_init == "posterior_mean":
         init_samples = samples.mean(dim=0, keepdim=True)  # (1, theta_dim)
         if not bool(within_support(ctx.inferred_prior, init_samples.to(ctx.device)).item()):
-            warnings.warn("posterior mean is outside the prior support; falling back to the "
-                          "single best-log-prob sample for the MAP initialization.")
-            init_samples = top_samples[:1]
+            warnings.warn("posterior mean outside prior support; using best-log-prob sample.")
+            init_samples = samples[torch.topk(log_probs, k=1).indices]
         n_init = n_opt = 1
     else:  # "top_k"
-        init_samples = top_samples
+        k = min(args.top_k, n_samp)
+        init_samples = samples[torch.topk(log_probs, k=k).indices]
         n_init = n_opt = k
 
     map_estimate = map_with_cached_embedding(
@@ -443,7 +512,8 @@ def infer_posterior(ctx: Ctx, posterior, obs, args, show_progress=True) -> dict:
         learning_rate=args.map_learning_rate, init_samples=init_samples,
         show_progress_bars=show_progress,
     )
-    return {"samples": samples, "log_probs": log_probs, "map_estimate": map_estimate}
+    return {"samples": samples, "log_probs": log_probs, "map_estimate": map_estimate,
+            "acceptance": acceptance, "n_posterior_samples": n_samp, "leaked": leaked}
 
 
 # =============================================================================
@@ -492,8 +562,9 @@ def plot_fe_comparison(ctx: Ctx, result, ax=None, n_band=300, hpd_frac=0.68):
             y_lo = min(y_lo, float(np.nanmin(y[vis])))
             y_hi = max(y_hi, float(np.nanmax(y[vis])))
 
-    keep = log_probs >= torch.quantile(log_probs, 1.0 - hpd_frac)
-    band = samples[keep]
+    # Posterior band (skip if the bounded sampler collected no/empty in-support samples).
+    band = samples[log_probs >= torch.quantile(log_probs, 1.0 - hpd_frac)] \
+        if (samples.shape[0] > 0 and log_probs.numel() > 0) else samples[:0]
     for i in range(min(n_band, band.shape[0])):
         _, y = ctx.eval_free_energy(params=to_canonical(ctx, band[i]), x_eval=ctx.x_eval)
         y = _align(y, y_map, inner)
@@ -535,17 +606,20 @@ def plot_fe_comparison(ctx: Ctx, result, ax=None, n_band=300, hpd_frac=0.68):
 def _inferred_bounds(ctx: Ctx):
     """Per-inferred-dim prior (lo, hi) arrays in ``inferred_idx`` order.
 
-    ``logD`` -> ``logD_lims``; spline knots ``g_i`` -> per-knot box ``center_i ± scale_i``;
-    physical params -> their ``*_lims``. Pinned params (lims ``[a, a]``) give ``lo == hi``
-    (zero width). Used both for pairplot axis limits and for normalizing the accuracy /
-    precision metrics so heterogeneously-scaled parameters contribute comparably.
+    ``logD`` -> ``logD_lims``; spline knots ``g_i`` -> per-knot box ``center_i ± scale_i``
+    (widened to ``center_i ± n_sigma·scale_i`` under a Gaussian knot prior, since ``scale``
+    is then the marginal std); physical params -> their ``*_lims``. Pinned params (lims
+    ``[a, a]``) give ``lo == hi`` (zero width). Used for pairplot axis limits and the
+    prior-entropy volume-ratio diagnostic.
     """
+    # Gaussian knots are unbounded; use center +/- n_sigma*scale as the plausible range.
+    half = ctx.n_sigma if getattr(ctx, "knot_prior", "independent") == "gaussian" else 1.0
     los, his = [], []
     for i in ctx.inferred_idx.tolist():
         if i == 0:
             lo, hi = ctx.data_cfg.prior.logD_lims
         elif 1 <= i <= ctx.num_knots:
-            c = ctx.prior_center[i - 1]; s = ctx.prior_scale[i - 1]
+            c = ctx.prior_center[i - 1]; s = half * ctx.prior_scale[i - 1]
             lo, hi = c - s, c + s
         else:
             name = PHYS_PARAM_NAMES[i - ctx.num_knots - 1]
@@ -586,8 +660,11 @@ def compute_metrics(ctx: Ctx, result) -> dict:
     log_probs = result["log_probs"].detach().double().numpy()
     return {
         "map_logprob": float(result["map_estimate"][1]),
-        "param_dist_l2": float(np.linalg.norm(map_theta - true_inf)),
-        "H_post": float(-log_probs.mean()),
+        "param_dist_l2": float(np.linalg.norm(map_theta - true_inf)),  # MAP-based; valid even if leaked
+        "H_post": (float(-log_probs.mean()) if log_probs.size else None),  # needs samples
+        "acceptance": result.get("acceptance"),
+        "n_posterior_samples": result.get("n_posterior_samples"),
+        "leaked": result.get("leaked"),
     }
 
 
@@ -757,6 +834,12 @@ def parse_args(argv=None):
     p.add_argument("--posterior-batch-size", type=int, default=100)
     p.add_argument("--log-prob-batch-size", type=int, default=50)
     p.add_argument("--top-k", type=int, default=500, help="Top-log-prob samples seeding the MAP search.")
+    # Bounded-sampler safeguard against the 0%-acceptance stall (posterior leaks out of support).
+    p.add_argument("--max-oversample", type=int, default=20,
+                   help="Hard cap on rejection proposals = max-oversample x num-posterior-samples; "
+                        "leaked cases are flagged instead of hanging.")
+    p.add_argument("--sample-giveup-proposals", type=int, default=2000,
+                   help="Give up sampling a case if 0 in-support samples after this many proposals.")
     # MAP
     p.add_argument("--map-num-iter", type=int, default=500)
     p.add_argument("--map-learning-rate", type=float, default=0.001)
@@ -778,10 +861,14 @@ def parse_args(argv=None):
     # matches how the model was trained.
     g = p.add_mutually_exclusive_group()
     g.add_argument("--nuisance-per-set", dest="nuisance_per_set", action="store_const", const=True,
-                   help="Build each observation set with ONE fixed nuisance shared across all traces.")
+                   help="PS: build each observation set with ONE fixed nuisance across all traces.")
     g.add_argument("--nuisance-per-trace", dest="nuisance_per_set", action="store_const", const=False,
-                   help="Resample unpinned nuisance per trace (matches per-trace-trained models).")
+                   help="PT: resample all unpinned nuisance per trace (matches per-trace-trained models).")
     p.set_defaults(nuisance_per_set=None)
+    p.add_argument("--nuisance-per-trace-params", nargs="+", default=None, metavar="NAME",
+                   help="PTkD: resample only these nuisance params per trace (e.g. kD), rest per-set. "
+                        "Overrides --nuisance-per-set/-trace. Default reads "
+                        "data_generation.nuisance_per_trace_params from the model config.")
     return p.parse_args(argv)
 
 
@@ -830,14 +917,35 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[output] {out_dir}")
 
-    # Per-set vs per-trace nuisance for observation building (default: match the model's
-    # training, read from data_config.yaml). Per-trace resamples the unpinned nuisance per
-    # trace; --set-pinned nuisance and the inferred landscape stay fixed across the set.
+    # Nuisance mode for observation building (PS / PT / PTkD). Default reads the model's
+    # data_config.yaml so the eval matches training; CLI flags override. PTkD resamples only
+    # the named params per trace. --set-pinned nuisance and the inferred landscape stay fixed.
     _dg = ctx.data_cfg.get("data_generation", {})
     cfg_nps = bool(_dg.get("nuisance_per_set", False)) if _dg else False
-    nuisance_per_set = args.nuisance_per_set if args.nuisance_per_set is not None else cfg_nps
-    _src = "CLI" if args.nuisance_per_set is not None else "data_config"
-    print(f"[setup] nuisance: {'per-set (fixed across traces)' if nuisance_per_set else 'per-trace (unpinned resampled)'} [{_src}]")
+    cfg_ptp = list(_dg.get("nuisance_per_trace_params", []) or []) if _dg else []
+    if args.nuisance_per_trace_params is not None:
+        want, nuisance_eval_mode, _src = list(args.nuisance_per_trace_params), "PTkD", "CLI"
+    elif args.nuisance_per_set is True:
+        want, nuisance_eval_mode, _src = [], "PS", "CLI"
+    elif args.nuisance_per_set is False:
+        want, nuisance_eval_mode, _src = "ALL", "PT", "CLI"
+    elif cfg_ptp:
+        want, nuisance_eval_mode, _src = cfg_ptp, "PTkD", "data_config"
+    elif cfg_nps:
+        want, nuisance_eval_mode, _src = [], "PS", "data_config"
+    else:
+        want, nuisance_eval_mode, _src = "ALL", "PT", "data_config"
+
+    _ci = canonical_index(ctx); _inf = set(ctx.inferred_idx.tolist())
+    _nuis_names = [n for n, i in _ci.items() if i not in _inf]
+    per_trace_names = (_nuis_names if want == "ALL" else list(want))
+    if nuisance_eval_mode == "PTkD" and not ({_ci[n] for n in per_trace_names if n in _ci} - _inf):
+        warnings.warn(f"--nuisance-per-trace-params {per_trace_names} resolve to no nuisance "
+                      f"dims (inferred/unknown); falling back to per-set (PS).")
+        want, nuisance_eval_mode = [], "PS"
+    nuisance_per_set = (nuisance_eval_mode == "PS")
+    print(f"[setup] nuisance eval mode: {nuisance_eval_mode}"
+          + (f" (per-trace: {per_trace_names})" if nuisance_eval_mode != "PS" else "") + f" [{_src}]")
 
     # ── Phase A: simulate ALL observations, then close the pool BEFORE any CUDA work.
     print(f"[simulate] {len(cases)} cases x {n_obs} obs ({args.n_sim_workers} workers) ...")
@@ -845,9 +953,8 @@ def main(argv=None):
     pool = Pool(processes=args.n_sim_workers, initializer=_init_worker, initargs=((seed or 0),))
     try:
         for c in cases:
-            sampler = (None if nuisance_per_set
-                       else _make_theta_sampler(ctx, c["true_params"],
-                                                 _nuisance_resample_idx(ctx, c.get("gt_nuisance"))))
+            ridx = _nuisance_resample_idx(ctx, want, c.get("gt_nuisance"))
+            sampler = None if ridx.numel() == 0 else _make_theta_sampler(ctx, c["true_params"], ridx)
             c["obs"] = build_observation(pool, c["true_params"], n_obs,
                                          args.n_simulations_pool, args.max_sim_attempts,
                                          theta_sampler=sampler)
@@ -878,20 +985,26 @@ def main(argv=None):
 
     # run_meta.json: the call's exact settings + per-case headline metrics. Out-of-support cases
     # carry null metrics (metrics is {}); H_prior is a model constant, saved once at the top level.
-    by_name = {res["name"]: res["metrics"] for res in results}
+    res_by_name = {res["name"]: res for res in results}
 
     def _case_meta(c):
-        m = by_name[c["name"]]
+        r = res_by_name[c["name"]]
+        m = r.get("metrics", {})
         return {"name": c["name"], "in_support": c["in_support"],
                 "map_logprob": m.get("map_logprob"),
                 "param_dist_l2": m.get("param_dist_l2"),
-                "H_post": m.get("H_post")}
+                "H_post": m.get("H_post"),
+                "acceptance": r.get("acceptance"),
+                "n_posterior_samples": r.get("n_posterior_samples"),
+                "leaked": r.get("leaked")}
 
     meta = {
         "timestamp": timestamp, "model_dir": str(cfg_path), "data_config": ctx.data_cfg_path,
         "device": device, "mode": str(ctx.data_cfg.simulator.mode), "num_knots": ctx.num_knots,
         "n_obs": n_obs, "seed": seed, "inferred_labels": ctx.inferred_labels,
         "H_prior": prior_entropy(ctx), "nuisance_per_set": nuisance_per_set,
+        "nuisance_eval_mode": nuisance_eval_mode,
+        "nuisance_per_trace_params": per_trace_names,
         "set": fixed, "n_prior_samples": args.n_prior_samples,
         "explicit_knots": [name for name, _ in knot_specs],
         "cases": [_case_meta(c) for c in cases],
@@ -899,13 +1012,16 @@ def main(argv=None):
     }
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
-    print("\n[summary]  case / param_dist_l2 / H_post")
+    print("\n[summary]  case / param_dist_l2 / accept% / leaked")
     for res in results:
         m = res["metrics"]
+        acc = res.get("acceptance"); acc_s = f"{acc:.1%}" if acc is not None else "  - "
+        flag = " LEAKED" if res.get("leaked") else ""
         if m:
-            print(f"   {res['name']:>30s}  l2={m['param_dist_l2']:.3f}  H_post={m['H_post']:.3f}")
+            l2 = m.get("param_dist_l2"); l2_s = f"{l2:.3f}" if l2 is not None else "  -  "
+            print(f"   {res['name']:>30s}  l2={l2_s}  acc={acc_s}{flag}")
         else:
-            print(f"   {res['name']:>30s}  (out of support — metrics skipped)")
+            print(f"   {res['name']:>30s}  (out of support — metrics skipped)  acc={acc_s}{flag}")
     print(f"\nDone. Results in: {out_dir}")
     return out_dir
 

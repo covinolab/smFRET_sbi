@@ -52,9 +52,7 @@ def _build_dists_for_token(cfg, token, num_knots, device, center, scale_):
             torch.tensor([cfg.prior.logD_lims[1]], device=device),
         )]
     if token == "knots":
-        return generate_spline_prior(
-            centers=center, scale=scale_, num_knots=num_knots, device=device
-        )
+        return _knot_prior_dists(cfg, center, scale_, num_knots, device)
     lo, hi = tuple(cfg.prior[f"{token}_lims"])
     return [dists.Uniform(
         torch.tensor([lo], device=device),
@@ -187,6 +185,91 @@ def generate_spline_prior(
     ]
     return prior_spline
 
+
+def _rbf_knot_covariance(
+        scales: Union[torch.Tensor, Sequence[float]],
+        correlation_length: float,
+        device: str = "cpu",
+        jitter: float = 1e-6,
+    ) -> torch.Tensor:
+    """RBF (squared-exponential) covariance over knots, in knot-index units.
+
+    ``K_ij = sigma_i * sigma_j * exp(-(i - j)^2 / (2 * l^2))`` where the marginal
+    std ``sigma_i`` is ``scales[i]`` and ``l`` is ``correlation_length``. Inner
+    knots are equally spaced in x (see ``make_spline_knots``), so an index-space
+    length maps linearly to physical x. A small ``jitter`` is added to the diagonal
+    so the matrix is comfortably positive-definite for a float32 Cholesky.
+    """
+    if correlation_length <= 0.0:
+        raise ValueError(
+            f"correlation_length must be positive; got {correlation_length}"
+        )
+    scales = torch.as_tensor(scales, dtype=torch.float32, device=device).reshape(-1)
+    n = scales.numel()
+    idx = torch.arange(n, dtype=torch.float32, device=device)
+    d2 = (idx[:, None] - idx[None, :]) ** 2
+    corr = torch.exp(-d2 / (2.0 * float(correlation_length) ** 2))
+    K = (scales[:, None] * scales[None, :]) * corr
+    if jitter:
+        K = K + float(jitter) * torch.eye(n, dtype=torch.float32, device=device)
+    return K
+
+
+def generate_correlated_spline_prior(
+        centers: Union[torch.Tensor, Sequence[float], None] = None,
+        scale: Union[float, Sequence[float]] = 1.0,
+        num_knots: int = 10,
+        correlation_length: float = 1.0,
+        device: str = "cpu",
+        jitter: float = 1e-6,
+    ) -> List[dists.MultivariateNormal]:
+    """Correlated Gaussian prior over the knot vector: g ~ N(center, K_rbf).
+
+    Mean is ``centers`` (zeros if None), the marginal std of knot ``i`` is
+    ``scale`` (scalar or per-knot, reused as-is from the uniform prior), and the
+    RBF ``correlation_length`` couples neighbouring knots to control landscape
+    smoothness. Returned as a **single-element list** ``[MultivariateNormal]`` so
+    callers can ``*``-spread it exactly where ``generate_spline_prior`` returned a
+    list of per-knot Uniforms; the one multivariate component has
+    ``event_shape=[num_knots]`` and slots into ``MultipleIndependent`` directly.
+    """
+    if centers is None:
+        loc = torch.zeros(num_knots, dtype=torch.float32, device=device)
+    else:
+        loc = torch.as_tensor(centers, dtype=torch.float32, device=device).reshape(-1)
+    if loc.numel() != num_knots:
+        raise ValueError(
+            f"center has length {loc.numel()} but num_knots={num_knots}."
+        )
+    scales = _normalize_scale(scale, num_knots)
+    cov = _rbf_knot_covariance(scales, correlation_length, device=device, jitter=jitter)
+    return [dists.MultivariateNormal(loc=loc, covariance_matrix=cov)]
+
+
+def _knot_prior_dists(cfg, center, scale_, num_knots, device):
+    """Dispatch the ``knots`` block to independent-uniform or correlated-Gaussian.
+
+    Reads ``prior.knot_prior`` (default ``independent``) and, for the Gaussian
+    case, ``prior.correlation_length`` (default 1.0). Returns a list of prior
+    components covering exactly ``num_knots`` sample dimensions in either case.
+    """
+    knot_prior = cfg.prior.get("knot_prior", "independent")
+    if knot_prior == "gaussian":
+        return generate_correlated_spline_prior(
+            centers=center, scale=scale_, num_knots=num_knots,
+            correlation_length=cfg.prior.get("correlation_length", 1.0),
+            device=device,
+        )
+    if knot_prior != "independent":
+        raise ValueError(
+            f"Unknown prior.knot_prior: {knot_prior!r}. "
+            f"Valid: 'independent', 'gaussian'."
+        )
+    return generate_spline_prior(
+        centers=center, scale=scale_, num_knots=num_knots, device=device
+    )
+
+
 def generate_spline_fret_prior(
     num_knots: int,
     logD_lims: tuple = (-2.0, 2.0),
@@ -200,6 +283,8 @@ def generate_spline_fret_prior(
     C_rg_lims: tuple = (0.0, 0.2),
     center: Union[torch.Tensor, List[float], None] = None,
     scale: Union[float, Sequence[float]] = 1.0,
+    knot_prior: str = "independent",
+    correlation_length: float = 1.0,
     device: str = "cpu",
 ) -> MultipleIndependent:
     """
@@ -220,6 +305,10 @@ def generate_spline_fret_prior(
             None → flat, symmetric prior (zero mean force).
         scale: Half-width of each knot's uniform box. Either a scalar (shared
             across all knots) or a length-n sequence for a per-knot half-width.
+        knot_prior: 'independent' (per-knot uniforms, default) or 'gaussian'
+            (correlated RBF multivariate normal over the knot vector).
+        correlation_length: RBF length in knot-index units; only used when
+            ``knot_prior='gaussian'``.
         device: Torch device.
 
     Examples
@@ -242,8 +331,20 @@ def generate_spline_fret_prior(
     
     if center is not None:
         center = torch.as_tensor(center, dtype=torch.float32, device=device)
-    
-    prior_spline = generate_spline_prior(centers=center, scale=scale, num_knots=num_knots, device=device)
+
+    if knot_prior == "gaussian":
+        prior_spline = generate_correlated_spline_prior(
+            centers=center, scale=scale, num_knots=num_knots,
+            correlation_length=correlation_length, device=device,
+        )
+    elif knot_prior == "independent":
+        prior_spline = generate_spline_prior(
+            centers=center, scale=scale, num_knots=num_knots, device=device
+        )
+    else:
+        raise ValueError(
+            f"Unknown knot_prior: {knot_prior!r}. Valid: 'independent', 'gaussian'."
+        )
 
     phys_lims = [
         R0_lims, kD_lims, k_gb_lims, k_rb_lims,
@@ -283,6 +384,8 @@ def generate_fret_prior_from_config(cfg, device: str = "cpu") -> MultipleIndepen
         C_rg_lims=tuple(cfg.prior.C_rg_lims),
         center=center,
         scale=cfg.prior.scale,
+        knot_prior=cfg.prior.get("knot_prior", "independent"),
+        correlation_length=cfg.prior.get("correlation_length", 1.0),
         device=device,
     )
 
@@ -297,7 +400,7 @@ def generate_posterior_prior_from_config(cfg, device: str = "cpu") -> MultipleIn
     cfg = OmegaConf.load(cfg) if isinstance(cfg, str) else cfg
 
     scale = cfg.prior.scale
-    center = cfg.prior.center if cfg.prior.center is not None else None
+    center = list(cfg.prior.center) if cfg.prior.center is not None else None
     num_knots = cfg.prior.num_knots
 
     prior_logD = dists.Uniform(
@@ -305,7 +408,7 @@ def generate_posterior_prior_from_config(cfg, device: str = "cpu") -> MultipleIn
         torch.tensor([cfg.prior.logD_lims[1]], device=device),
     )
 
-    prior_spline = generate_spline_prior(centers=center, scale=scale, num_knots=num_knots, device=device)
+    prior_spline = _knot_prior_dists(cfg, center, scale, num_knots, device)
 
     prior_R0 = dists.Uniform(
         torch.tensor([cfg.prior.R0_lims[0]], device=device),
